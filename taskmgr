@@ -1,0 +1,8 @@
+#!/bin/sh
+# Task Manager in the terminal: runs taskmgr.py in its own venv. A symlink to this file works too.
+here=$(dirname "$(readlink -f "$0")")
+if [ ! -x "$here/venv/bin/python" ]; then
+    echo "No Python environment in $here/venv yet: run $here/install.sh first." >&2
+    exit 1
+fi
+exec "$here/venv/bin/python" "$here/taskmgr.py" "$@"
