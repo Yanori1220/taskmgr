@@ -24,7 +24,7 @@ from rich.cells import cell_len
 from rich.style import Style
 
 HERE = Path(__file__).resolve().parent
-COLS, ROWS = 120, 36
+COLS, ROWS = 130, 40                # the window install.sh opens
 STEPS = 150                      # readings fed in before the first picture: the graphs need history
 SCALE = 2                        # drawn at twice the size, so it stays sharp on high-density screens
 FONTS = Path("/usr/share/fonts/truetype/dejavu")
@@ -136,8 +136,9 @@ class Fake:
 
 class FakeGpus:
     handles = [None, None]
-    names = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090"]
-    driver = "570.133.07"
+    names = ["NVIDIA RTX PRO 5000 Blackwell", "NVIDIA RTX PRO 4500 Blackwell"]   # workstation cards: they have GPM
+    driver = "580.95.05"
+    has_gpm = True
 
     def close(self) -> None:
         pass
@@ -177,8 +178,8 @@ class FakeSampler(tm.Sampler):
         for pid, ppid, name, uid, user, cmd, threads, cpu, mb, cwd, disk in self.fake.rows:
             kernel = pid == 2 or ppid == 2
             c = cpu * load[pid] if pid in load else cpu * (1 + 0.4 * r.uniform(-1, 1))
-            gpu = {0: int(19.6 * GB)} if pid == 3561 else {0: 210 * MB} if pid == 1850 else {}
-            gpu = {0: 180 * MB} if pid == 2400 else {1: int(17.8 * GB)} if pid == 3300 else gpu
+            gpu = {0: int(43.2 * GB)} if pid == 3561 else {0: 210 * MB} if pid == 1850 else {}
+            gpu = {0: 180 * MB} if pid == 2400 else {1: int(21.4 * GB)} if pid == 3300 else gpu
             procs[pid] = tm.Proc(
                 pid=pid, ppid=ppid, ct=float(pid), name=name, uid=uid, user=user, status="running" if c > 50 else "sleeping",
                 threads=threads, cmdline=cmd, cpu=max(0.0, c) / NCPU, mem=None if kernel else int(mb * MB),
@@ -218,12 +219,18 @@ class FakeSampler(tm.Sampler):
         nics = [tm.NicInfo("enp6s0", False, True, 2500, ["192.168.1.42"], ["fe80::2e0:4cff:fe68:1f2a"], recv, sent,
                            int(self.totals["enp6s0"][0] + recv * self.k), int(self.totals["enp6s0"][1] + sent * self.k))]
         on = [{pid: p.gpu_mem[i] for pid, p in procs.items() if i in p.gpu_mem} for i in (0, 1)]
-        gpus = [tm.GpuInfo(0, FakeGpus.names[0], g, sum(on[0].values()) + 310 * MB, 24 * GB, 64 + 3 * w(30),
-                           290 + 40 * w(4) + 10 * r.random(), 450.0, 47 + 3 * w(30), int(2610 + 60 * w(6)), 10501,
-                           on[0]),
-                tm.GpuInfo(1, FakeGpus.names[1], train, sum(on[1].values()) + 260 * MB, 24 * GB, 71 + 2 * w(25, 0.7),
-                           300 + 30 * w(5, 2.0) + 8 * r.random(), 350.0, 62 + 4 * w(25, 0.7),
-                           int(1830 + 45 * w(7, 1.0)), 9751, on[1])]
+        # card 0 serves the model: writing text is held back by memory bandwidth, the tensor cores idle a lot;
+        # card 1 trains: tensor cores busy, fed over PCIe, held at its 200 W power cap
+        watts = 245 + 35 * w(4) + 10 * r.random()
+        gpus = [tm.GpuInfo(0, FakeGpus.names[0], g, sum(on[0].values()) + 310 * MB, 48 * GB, 72 + 3 * w(30),
+                           watts, 300.0, 58 + 4 * w(30), int(2550 + 60 * w(6)), 14001, on[0],
+                           sm=30 + 45 * serve, tensor=6 + 20 * serve, mem_bw=30 + 55 * serve,
+                           pcie_tx=(2 + 3 * serve) * MB, pcie_rx=(1 + 2 * serve) * MB, slowed=4 if watts > 285 else 0),
+                tm.GpuInfo(1, FakeGpus.names[1], train, sum(on[1].values()) + 260 * MB, 32 * GB, 76 + 2 * w(25, 0.7),
+                           min(200.0, 192 + 6 * w(5, 2.0) + 2 * r.random()), 200.0, 66 + 4 * w(25, 0.7),
+                           int(2190 + 45 * w(7, 1.0)), 12001, on[1],
+                           sm=62 + 0.33 * train, tensor=20 + 0.55 * train, mem_bw=28 + 0.35 * train,
+                           pcie_tx=(60 + 80 * job) * MB, pcie_rx=(0.6 + 1.6 * job) * GB, slowed=4)]
         user_procs = [p for p in procs.values() if not p.kernel]
         return tm.Snapshot(
             t=1773494525.0 + self.k, cpu=cpu, freq=sum(freq) / NCPU, freq_max=5881.0,

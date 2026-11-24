@@ -38,10 +38,17 @@ column names. Enter expands a group, and Del ends a task after asking (SIGTERM, 
 
 **Details**: one row per process, with PID, status, user, threads and command line.
 
-**GPU** (NVIDIA, through NVML): every card at once, side by side. Each one has graphs of its use and
-memory over the same span of time, its temperature, power, fan and clocks, and the processes on it with
-how much memory each holds. Cards that do not fit across the window wrap into rows, and the tab
-scrolls when the window is too small for them. The tab is there only when an NVIDIA card is.
+**GPU** (NVIDIA, through NVML): every card at once, side by side. Each one has graphs over the same span
+of time, its temperature, power, fan and clocks, what is holding its clock down (power cap, heat...),
+and the processes on it with how much memory each holds. Cards that do not fit across the window wrap
+into rows, and the tab scrolls when the window is too small for them. The tab is there only when an
+NVIDIA card is.
+
+NVIDIA's "utilization" only says whether any work ran at all: one small program running all the time
+shows 100%. Cards with NVIDIA's GPM readings (data-center and workstation cards from Hopper on) also
+show how many of their compute units are at work, how busy their tensor cores are, how much of their
+memory bandwidth is in use, with a graph (an LLM writing text is mostly held back by it), and their
+PCIe traffic.
 
 ![The GPU tab](docs/gpu.png)
 

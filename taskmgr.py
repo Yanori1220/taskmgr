@@ -116,6 +116,17 @@ HELP_ZH = """\
   下面的清單：最忙的邏輯處理器，和上面在跑的程式。只追蹤用量超過一個核心約 3% 的程式；
   程式在核心之間換來換去時，算在它最後停的那個核心上，所以有時候會是「—」。
 
+GPU 分頁（按 4）
+  使用率        NVIDIA 自己的定義：有任何工作在卡上跑的時間比例。一個小程式一直在跑就是 100%，
+                所以看不出卡有多忙。
+  SM 忙碌       卡上的運算單元（SM）有多少在工作
+  張量核心      張量核心（專門做矩陣運算的部分）在跑的時間比例
+  記憶體頻寬    卡的記憶體速度用了多少；LLM 產生文字時，速度多半卡在這裡
+  PCIe          卡和電腦其他部分之間在搬的資料
+  降頻原因      時脈現在為什麼沒到最高：功耗上限、過熱、閒置……
+  SM 忙碌、張量核心、記憶體頻寬和 PCIe 要卡支援 NVIDIA 的 GPM 讀數（Hopper 以後的資料中心和
+  工作站卡）；不支援的卡就不顯示這幾項。
+
 Linux 的限制
   每個程式各用多少網路，一般使用者看不到，所以只有效能分頁的總量。
   別的使用者（root、postgres…）的程式看得到 CPU 和記憶體，看不到磁碟讀寫，
@@ -160,6 +171,18 @@ Each core (Performance tab, CPU, press l)
   about 3% of one CPU are followed, and a program that moves between CPUs counts on the last one it
   ran on, so some rows show "—".
 
+GPU tab (press 4)
+  Utilization       NVIDIA's own figure: the share of time any work ran on the card; one small
+                    program running all the time makes it 100%, so it says little about load.
+  SMs busy          how many of the card's compute units (SMs) are at work
+  Tensor cores      the share of time the tensor cores, the parts that do matrix math, ran
+  Memory bandwidth  how much of the card's memory speed is in use; an LLM writing text is mostly
+                    held back by this
+  PCIe              data moving between the card and the rest of the computer
+  Slowed by         why the clock is below its top right now: power cap, heat, idle...
+  SMs busy, tensor cores, memory bandwidth and PCIe need a card with NVIDIA's GPM readings
+  (data-center and workstation cards from Hopper on); other cards leave them out.
+
 What Linux does not show
   How much network each process uses is hidden from an ordinary user, so only the totals are shown.
   Other users' processes (root, postgres...) show CPU and memory but not disk I/O, and ending
@@ -203,6 +226,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "i_down": "未連線", "i_vram": "記憶體", "i_temp": "溫度", "i_power": "功耗",
         "i_fan": "風扇", "i_sm": "核心時脈", "i_memclk": "記憶體時脈", "i_driver": "驅動程式版本",
         "i_gpu_procs": "使用這張卡的程式", "i_none": "沒有",
+        "i_sm_busy": "SM 忙碌", "i_tensor": "張量核心", "i_bw": "記憶體頻寬", "i_pcie_tx": "PCIe 傳送",
+        "i_pcie_rx": "PCIe 接收", "i_slowed": "降頻原因", "g_bw": "% 記憶體頻寬",
+        "sl_idle": "閒置", "sl_power": "功耗上限", "sl_heat": "過熱", "sl_hw": "硬體降速", "sl_brake": "電源煞車",
+        "sl_clocks": "時脈設定", "sl_display": "顯示時脈", "sl_sync": "同步加速", "sl_board": "板卡限制",
+        "sl_reliability": "可靠性",
         "b_zoom": "時間範圍", "minutes": "{n} 分鐘",
         "cores_hint": "l：看每個核心的工作狀態", "cores_back": "l：回到整體",
         "lg_user": "程式", "lg_sys": "系統核心", "lg_iow": "等待 I/O", "lg_cell": "每格：邏輯處理器　使用率　頻率 GHz",
@@ -261,6 +289,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "i_vram": "Memory", "i_temp": "Temperature", "i_power": "Power", "i_fan": "Fan",
         "i_sm": "Core clock", "i_memclk": "Memory clock", "i_driver": "Driver version",
         "i_gpu_procs": "Processes on this GPU", "i_none": "none",
+        "i_sm_busy": "SMs busy", "i_tensor": "Tensor cores", "i_bw": "Memory bandwidth", "i_pcie_tx": "PCIe send",
+        "i_pcie_rx": "PCIe receive", "i_slowed": "Slowed by", "g_bw": "% Memory bandwidth",
+        "sl_idle": "idle", "sl_power": "power cap", "sl_heat": "heat", "sl_hw": "HW slowdown",
+        "sl_brake": "power brake", "sl_clocks": "app clocks", "sl_display": "display",
+        "sl_sync": "sync boost", "sl_board": "board limit", "sl_reliability": "reliability",
         "b_zoom": "Time span", "minutes": "{n} minutes",
         "cores_hint": "l: what each core is doing", "cores_back": "l: back to overall",
         "lg_user": "programs", "lg_sys": "kernel", "lg_iow": "I/O wait", "lg_cell": "each cell: logical processor, use, clock GHz",
@@ -626,6 +659,12 @@ class GpuInfo:
     clock_sm: int | None
     clock_mem: int | None
     procs: dict[int, int]          # pid -> bytes on this card
+    sm: float | None = None        # GPM, below: % of the card's SMs (its compute units) at work
+    tensor: float | None = None    # % of the time the tensor cores (matrix math) ran
+    mem_bw: float | None = None    # % of the memory bandwidth in use
+    pcie_tx: float | None = None   # bytes/s the card sent over PCIe
+    pcie_rx: float | None = None   # bytes/s it received
+    slowed: int | None = None      # why the clock is below its top: NVML's clock event reasons, as bits
 
 
 @dataclass
@@ -1123,6 +1162,54 @@ def _s(v: object) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
+class Gpm:
+    """One card's GPM readings (NVML's "GPU performance monitoring", on Hopper and newer data-center and
+    workstation cards): how busy the card really is. GPM compares two samples, so each reading takes one
+    and compares it with the one before."""
+
+    METRICS = ("SM_UTIL", "ANY_TENSOR_UTIL", "DRAM_BW_UTIL", "PCIE_TX_PER_SEC", "PCIE_RX_PER_SEC")
+
+    def __init__(self, handle) -> None:
+        self.handle = handle
+        self.samples = [nv.nvmlGpmSampleAlloc(), nv.nvmlGpmSampleAlloc()]   # the one before, the new one
+        self.taken = False                                                  # the one before holds a sample
+        self.req = nv.c_nvmlGpmMetricsGet_t()
+        self.req.version = nv.NVML_GPM_METRICS_GET_VERSION
+        self.req.numMetrics = len(self.METRICS)
+        for k, name in enumerate(self.METRICS):
+            self.req.metrics[k].metricId = getattr(nv, f"NVML_GPM_METRIC_{name}")
+
+    def read(self) -> list[float | None]:
+        """METRICS since the last reading, in that order (PCIe in MiB/s); None: not known (yet)."""
+        out: list[float | None] = [None] * len(self.METRICS)
+        before, new = self.samples
+        try:
+            nv.nvmlGpmSampleGet(self.handle, new)
+        except Exception:
+            self.taken = False
+            return out
+        if self.taken:
+            try:
+                self.req.sample1, self.req.sample2 = before, new
+                nv.nvmlGpmMetricsGet(self.req)
+                out = [m.value if m.nvmlReturn == 0 else None for m in self.req.metrics[:len(self.METRICS)]]
+            except Exception:
+                pass
+        self.samples, self.taken = [new, before], True
+        return out
+
+    def free(self) -> None:
+        for s in self.samples:
+            nv.nvmlGpmSampleFree(s)
+
+
+def gpm_for(handle) -> Gpm | None:
+    try:
+        return Gpm(handle) if nv.nvmlGpmQueryDeviceSupport(handle).isSupportedDevice else None
+    except Exception:              # an older card, driver or pynvml
+        return None
+
+
 class Gpus:
     """NVIDIA cards through NVML, numbered the way nvidia-smi numbers them."""
 
@@ -1132,6 +1219,7 @@ class Gpus:
         self.driver = ""
         self.lock = threading.Lock()   # a reading (in the worker thread) and close() never overlap
         self.closed = False
+        self.gpm: list[Gpm | None] = []
         if nv is None:
             return
         try:
@@ -1143,6 +1231,13 @@ class Gpus:
             self.handles, self.names = [], []
         self.last_ts = [0] * len(self.handles)
         self.mem_v2 = hasattr(nv, "nvmlMemory_v2")
+        self.gpm = [gpm_for(h) for h in self.handles]
+        self.slowed_fn = (getattr(nv, "nvmlDeviceGetCurrentClocksEventReasons", None)       # its newer name
+                          or getattr(nv, "nvmlDeviceGetCurrentClocksThrottleReasons", None))
+
+    @property
+    def has_gpm(self) -> bool:
+        return any(self.gpm)
 
     @staticmethod
     def _call(fn, *a, **kw):
@@ -1159,6 +1254,9 @@ class Gpus:
         if not self.lock.acquire(timeout=2):
             return
         try:
+            for g in self.gpm:
+                if g:
+                    self._call(g.free)
             if self.handles:
                 self._call(nv.nvmlShutdown)
         finally:
@@ -1196,6 +1294,7 @@ class Gpus:
                     self.last_ts[i] = max(self.last_ts[i], smp.timeStamp)
                 for pid, us in acc.items():
                     util_by_pid.setdefault(pid, {})[i] = sum(us) / len(us)
+            sm, tensor, bw, tx, rx = self.gpm[i].read() if self.gpm[i] else (None,) * 5
             infos.append(GpuInfo(
                 index=i, name=self.names[i] if i < len(self.names) else f"GPU {i}",
                 util=float(util.gpu) if util else None,
@@ -1206,7 +1305,9 @@ class Gpus:
                 fan=c(nv.nvmlDeviceGetFanSpeed, h),
                 clock_sm=c(nv.nvmlDeviceGetClockInfo, h, nv.NVML_CLOCK_SM),
                 clock_mem=c(nv.nvmlDeviceGetClockInfo, h, nv.NVML_CLOCK_MEM),
-                procs=procs))
+                procs=procs, sm=sm, tensor=tensor, mem_bw=bw,
+                pcie_tx=None if tx is None else tx * MB, pcie_rx=None if rx is None else rx * MB,
+                slowed=c(self.slowed_fn, h) if self.slowed_fn else None))
         return infos, mem_by_pid, util_by_pid
 
 
@@ -1519,6 +1620,7 @@ class History:
         for g in s.gpus:
             self.add(f"gpu{g.index}.util", g.util or 0)
             self.add(f"gpu{g.index}.mem", g.mem_used or 0)
+            self.add(f"gpu{g.index}.bw", g.mem_bw)          # None: no GPM, or its first reading
         for d in s.disks:
             self.add(f"disk.{d.dev.name}.active", d.active)
             self.add(f"disk.{d.dev.name}.read", d.read)
@@ -1566,8 +1668,9 @@ class Graph(Widget):
         else:
             fit = lambda values: values[-w:]  # noqa: E731
         lines: list[Text] = []
-        per = (h - 1) // len(self.series)
-        for s in self.series:
+        base, extra = divmod(h - 1, len(self.series))   # rows per graph; the first ones get what is left over
+        for n, s in enumerate(self.series):
+            per = base + (n < extra)
             if s.parts:                         # stacked parts, scaled to the peak of their sum
                 parts = [(name, fit(values), color) for name, values, color in s.parts]
                 sums = [sum(v or 0 for v in col) for col in zip(*(values for _, values, _ in parts))]
@@ -1904,6 +2007,23 @@ def disk_type(d: DiskDev) -> str:
     return f"{kind} (NVMe)" if d.nvme else kind or G.dash
 
 
+# NVML's clock event reasons (bits), the most telling first: why a card runs below its top clock
+SLOWED = ((0x60, "sl_heat"), (0x80, "sl_brake"), (0x08, "sl_hw"), (0x04, "sl_power"), (0x200, "sl_board"),
+          (0x400, "sl_reliability"), (0x01, "sl_idle"), (0x02, "sl_clocks"), (0x100, "sl_display"),
+          (0x10, "sl_sync"))
+
+
+def slowed_by(g: GpuInfo) -> str:
+    """The most telling reason for the card's clock to be held down. The driver also sets its power cap
+    bit, on and off, on a card that draws a tenth of its limit, so that one counts only near the limit."""
+    bits = g.slowed
+    if bits is None:
+        return G.dash
+    if bits & 0x04 and not (g.power and g.power_limit and g.power >= 0.9 * g.power_limit):
+        bits &= ~0x04
+    return next((T[key] for mask, key in SLOWED if bits & mask), T["h_none"])
+
+
 # ---------------------------------------------------------------- the app
 
 class TaskManager(App):
@@ -1964,6 +2084,7 @@ class TaskManager(App):
         self.sampler = sampler
         self.interval = interval
         self.has_gpu = bool(sampler.gpus.handles)
+        self.has_gpm = bool(getattr(sampler.gpus, "has_gpm", False))
         self.snap: Snapshot | None = None
         self.history = History(math.ceil(max(s for s in SPANS if s) / interval * 1.1) + 10)  # the longest span
         self.paused = False
@@ -2446,30 +2567,48 @@ class TaskManager(App):
 
     # ----------------------------------------------------------- the GPU tab
 
-    GRAPH_MIN = 9          # a card's graph at its smallest: per series a label and three rows, then the time axis
     PROCS_MAX = 8          # processes listed under a card at most
 
-    def gpu_pairs(self, g: GpuInfo, widest: bool = False) -> list[tuple[str, str]]:
-        """A card's numbers. `widest`: each value as wide as it can get, to size the grid by, so the grid
-        keeps its shape while the numbers change."""
+    @property
+    def graph_min(self) -> int:
+        """A card's graphs at their smallest: each a label and two rows, then the time axis."""
+        return 3 * (3 if self.has_gpm else 2) + 1
+
+    # A card's numbers in fours: what it is doing; its state; clocks and PCIe. Memory sits under memory
+    # bandwidth, the two widest in one column, so four columns fit in half of a 130-wide window.
+    GPU_KEYS = ("util", "sm", "tensor", "bw", "temp", "power", "fan", "vram", "sm_clock", "memclk", "tx", "rx",
+                "slowed", "driver")
+    GPU_KEYS_NO_GPM = ("util", "vram", "temp", "power", "fan", "sm_clock", "memclk", "slowed", "driver")
+    GPU_LEAST = ("driver", "memclk", "fan")   # left out first when a card's panel is narrow
+
+    def gpu_pairs(self, g: GpuInfo, keys: tuple[str, ...], widest: bool = False) -> list[tuple[str, str]]:
+        """A card's numbers, those in `keys`. `widest`: each value as wide as it can get, to size the grid
+        by, so the grid keeps its shape while the numbers change."""
         if widest:
             g = replace(g, util=100.0, mem_used=1000 * MB, temp=100.0, power=g.power_limit or 1000.0, fan=100.0,
-                        clock_sm=99_999, clock_mem=99_999)
-        return [(T["i_util"], pct0(g.util)),
-                (T["i_vram"], f"{fmt_bytes(g.mem_used)} / {fmt_bytes(g.mem_total)}"),
-                (T["i_temp"], G.dash if g.temp is None else f"{g.temp:.0f} °C"),
-                (T["i_power"], G.dash if g.power is None else
-                 f"{g.power:.0f} / {g.power_limit:.0f} W" if g.power_limit else f"{g.power:.0f} W"),
-                (T["i_fan"], pct0(g.fan)),
-                (T["i_sm"], G.dash if g.clock_sm is None else f"{g.clock_sm:,} MHz"),
-                (T["i_memclk"], G.dash if g.clock_mem is None else f"{g.clock_mem:,} MHz"),
-                (T["i_driver"], self.sampler.gpus.driver or G.dash)]
+                        clock_sm=99_999, clock_mem=99_999, sm=100.0, tensor=100.0, mem_bw=100.0,
+                        pcie_tx=1000 * MB, pcie_rx=1000 * MB)
+        v = {"util": pct0(g.util), "sm": pct0(g.sm), "tensor": pct0(g.tensor), "bw": pct0(g.mem_bw),
+             "vram": f"{fmt_bytes(g.mem_used)} / {fmt_bytes(g.mem_total)}",
+             "temp": G.dash if g.temp is None else f"{g.temp:.0f} °C",
+             "power": G.dash if g.power is None else
+             f"{g.power:.0f} / {g.power_limit:.0f} W" if g.power_limit else f"{g.power:.0f} W",
+             "fan": pct0(g.fan), "sm_clock": G.dash if g.clock_sm is None else f"{g.clock_sm:,} MHz",
+             "memclk": G.dash if g.clock_mem is None else f"{g.clock_mem:,} MHz",
+             "tx": fmt_rate(g.pcie_tx), "rx": fmt_rate(g.pcie_rx),
+             "slowed": max((T[key] for _, key in SLOWED), key=lambda s: Text(s).cell_len) if widest
+             else slowed_by(g), "driver": self.sampler.gpus.driver or G.dash}
+        label = {"util": "i_util", "sm": "i_sm_busy", "tensor": "i_tensor", "bw": "i_bw", "vram": "i_vram",
+                 "temp": "i_temp", "power": "i_power", "fan": "i_fan", "sm_clock": "i_sm", "memclk": "i_memclk",
+                 "tx": "i_pcie_tx", "rx": "i_pcie_rx", "slowed": "i_slowed", "driver": "i_driver"}
+        return [(T[label[k]], v[k]) for k in keys]
 
     def gpu_series(self, g: GpuInfo) -> list[Series]:
         h = self.history
-        return [Series(T["g_util"], h.get(f"gpu{g.index}.util"), 100, "100%", COLORS["gpu"]),
-                Series(T["g_gpumem"], h.get(f"gpu{g.index}.mem"), g.mem_total or 1,
-                       fmt_bytes(g.mem_total), COLORS["gpu"])]
+        bw = [Series(T["g_bw"], h.get(f"gpu{g.index}.bw"), 100, "100%", COLORS["gpu"])] if self.has_gpm else []
+        return ([Series(T["g_util"], h.get(f"gpu{g.index}.util"), 100, "100%", COLORS["gpu"])] + bw
+                + [Series(T["g_gpumem"], h.get(f"gpu{g.index}.mem"), g.mem_total or 1,
+                          fmt_bytes(g.mem_total), COLORS["gpu"])])
 
     @staticmethod
     def gpu_shown(g: GpuInfo, lines: int) -> tuple[list[tuple[int, int]], int]:
@@ -2504,18 +2643,26 @@ class TaskManager(App):
         used_lines = len(shown) + (1 if left_out else 0)
         return out + [Text("")] * max(0, lines - used_lines)
 
-    def gpu_grid(self, width: int) -> tuple[int, int]:
-        """(columns, lines) of the cards' numbers at this width: one shape for every card."""
+    def gpu_grid(self, width: int) -> tuple[tuple[str, ...], int, int]:
+        """(which numbers, columns, lines) of the cards' numbers at this width, one shape for every card.
+        A narrow panel leaves out the least telling numbers until they fit in four rows."""
+        keys = self.GPU_KEYS if self.has_gpm else self.GPU_KEYS_NO_GPM
         cards = self.snap.gpus if self.snap else []
         if not cards:
-            return 2, 8
-        cols = min(info_cols(self.gpu_pairs(g, widest=True), width, tight=True) for g in cards)
-        return cols, 2 * math.ceil(len(self.gpu_pairs(cards[0])) / cols)
+            return keys, 2, 2 * math.ceil(len(keys) / 2)
+        least = list(self.GPU_LEAST)
+        while True:
+            cols = min(info_cols(self.gpu_pairs(g, keys, widest=True), width, tight=True) for g in cards)
+            rows = math.ceil(len(keys) / cols)
+            if rows <= 4 or not least:
+                return keys, cols, 2 * rows
+            drop = least.pop(0)
+            keys = tuple(k for k in keys if k != drop)
 
     def gpu_min_height(self, width: int) -> int:
         """The least height a card's panel needs at this width: its title, the graph at its smallest, the
         numbers, and the first two processes."""
-        return 2 + self.GRAPH_MIN + 1 + self.gpu_grid(width)[1] + 2 + 2
+        return 2 + self.graph_min + 1 + self.gpu_grid(width)[2] + 2 + 2
 
     def render_gpu(self) -> None:
         """Every card at once. All the panels are drawn alike, the numbers in the same grid and the process
@@ -2527,8 +2674,8 @@ class TaskManager(App):
             return
         width = panels[0][0].query_one(".gp-title", Static).size.width or 40
         height = panels[0][0].size.height
-        cols, grid_lines = self.gpu_grid(width)
-        room = height - 2 - self.GRAPH_MIN - 1 - grid_lines - 2   # title, graph, blank, numbers, blank, heading
+        keys, cols, grid_lines = self.gpu_grid(width)
+        room = height - 2 - self.graph_min - 1 - grid_lines - 2   # title, graphs, blank, numbers, blank, heading
         most = max(len(g.procs) for _, g in panels)
         lines = min(most, self.PROCS_MAX, max(1, room))
         shown = {g.index: self.gpu_shown(g, lines) for _, g in panels}
@@ -2554,7 +2701,7 @@ class TaskManager(App):
             heading = Text(T["i_gpu_procs"] + ("" if g.procs else f"：{T['i_none']}" if ARGS.lang == "zh"
                                                else f": {T['i_none']}"), style="dim")
             panel.query_one(".gp-info", Static).update(RichGroup(
-                info_grid(self.gpu_pairs(g), width, tight=True, cols=cols), Text(""), heading,
+                info_grid(self.gpu_pairs(g, keys), width, tight=True, cols=cols), Text(""), heading,
                 *self.gpu_procs(*shown[g.index], lines, names, (label_w, name_w, pid_w))))
 
     # ----------------------------------------------------------- events
