@@ -6,8 +6,9 @@
     taskmgr --lang zh        Chinese labels (not on the Linux console, Ctrl+Alt+F3: it has no CJK font)
     taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 
-Inside, ? lists every key. Three tabs, as in Windows: Processes (grouped by app, in three sections),
-Performance (CPU, memory, each disk, each network adapter, each GPU), Details (one row per process).
+Inside, ? lists every key. Three tabs as in Windows: Processes (grouped by app, in three sections),
+Performance (CPU, memory, each disk, each network adapter), Details (one row per process); and, with
+an NVIDIA card, a fourth: GPU, every card side by side.
 The Python programs of your own projects can be grouped by project: see groups.toml in the README.
 
 Two things Linux keeps from an ordinary user, so this cannot show them either: how much network each
@@ -30,7 +31,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -42,7 +43,7 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -84,7 +85,7 @@ ARGS = parse_args(None if __name__ == "__main__" else [])
 
 HELP_ZH = """\
 按鍵
-  1  2  3          切換分頁：處理程序／效能／詳細資料（也可以用滑鼠點）
+  {tab_keys:<17}切換分頁：{tab_names}（也可以用滑鼠點）
   ↑ ↓  PgUp PgDn   移動
   Enter            展開或收合群組和分區（滑鼠：點一下選取，再點一下展開）
   /                搜尋名稱、PID 或命令列；Esc 清除
@@ -123,7 +124,7 @@ Esc 關閉"""
 
 HELP_EN = """\
 Keys
-  1  2  3          switch tabs: Processes / Performance / Details (or click them)
+  {tab_keys:<17}switch tabs: {tab_names} (or click them)
   Up Down PgUp PgDn  move
   Enter            expand or collapse a group or section (mouse: click to select, click again to expand)
   /                search name, PID or command line; Esc clears
@@ -166,7 +167,7 @@ Esc closes"""
 STRINGS: dict[str, dict[str, str]] = {
     "zh": {
         "title": "工作管理員", "paused": "已暫停　空白鍵繼續",
-        "tab_proc": "1 處理程序", "tab_perf": "2 效能", "tab_details": "3 詳細資料",
+        "tab_proc": "1 處理程序", "tab_perf": "2 效能", "tab_details": "3 詳細資料", "tab_gpu": "4 GPU",
         "sec_apps": "應用程式", "sec_background": "背景處理程序", "sec_system": "系統處理程序",
         "c_name": "名稱", "c_cpu": "CPU", "c_mem": "記憶體", "c_disk": "磁碟", "c_gpu": "GPU",
         "c_gpumem": "GPU 記憶體", "c_pid": "PID", "c_status": "狀態", "c_user": "使用者名稱",
@@ -196,7 +197,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "h_warn": "警告", "h_none": "沒有", "h_na": "讀不到健康度（udisks 沒有回應）",
         "i_recv": "接收", "i_sent": "傳送", "i_link": "連線速度", "i_adapter": "介面卡",
         "i_ipv4": "IPv4 位址", "i_ipv6": "IPv6 位址", "i_total_recv": "總共接收", "i_total_sent": "總共傳送",
-        "i_down": "未連線", "i_gpumem": "專用 GPU 記憶體", "i_temp": "溫度", "i_power": "功耗",
+        "i_down": "未連線", "i_vram": "記憶體", "i_temp": "溫度", "i_power": "功耗",
         "i_fan": "風扇", "i_sm": "核心時脈", "i_memclk": "記憶體時脈", "i_driver": "驅動程式版本",
         "i_gpu_procs": "使用這張卡的程式", "i_none": "沒有",
         "cores_hint": "l：看每個核心的工作狀態", "cores_back": "l：回到整體",
@@ -218,7 +219,7 @@ STRINGS: dict[str, dict[str, str]] = {
     },
     "en": {
         "title": "Task Manager", "paused": "Paused   Space resumes",
-        "tab_proc": "1 Processes", "tab_perf": "2 Performance", "tab_details": "3 Details",
+        "tab_proc": "1 Processes", "tab_perf": "2 Performance", "tab_details": "3 Details", "tab_gpu": "4 GPU",
         "sec_apps": "Apps", "sec_background": "Background processes", "sec_system": "System processes",
         "c_name": "Name", "c_cpu": "CPU", "c_mem": "Memory", "c_disk": "Disk", "c_gpu": "GPU",
         "c_gpumem": "GPU memory", "c_pid": "PID", "c_status": "Status", "c_user": "User name",
@@ -253,7 +254,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "i_recv": "Receive", "i_sent": "Send", "i_link": "Link speed", "i_adapter": "Adapter",
         "i_ipv4": "IPv4 address", "i_ipv6": "IPv6 address", "i_total_recv": "Total received",
         "i_total_sent": "Total sent", "i_down": "Not connected",
-        "i_gpumem": "Dedicated GPU memory", "i_temp": "Temperature", "i_power": "Power", "i_fan": "Fan",
+        "i_vram": "Memory", "i_temp": "Temperature", "i_power": "Power", "i_fan": "Fan",
         "i_sm": "Core clock", "i_memclk": "Memory clock", "i_driver": "Driver version",
         "i_gpu_procs": "Processes on this GPU", "i_none": "none",
         "cores_hint": "l: what each core is doing", "cores_back": "l: back to overall",
@@ -1646,6 +1647,62 @@ class PerfItem(ListItem):
         self.key = key
 
 
+class GpuPanel(Vertical):
+    """One card on the GPU tab: its name, graphs of its use and memory, its numbers, the processes on it."""
+
+    def __init__(self, index: int) -> None:
+        super().__init__(id=f"gpu-{index}", classes="gpu-panel")
+        self.index = index
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="gp-title")
+        yield Graph(classes="gp-graph")
+        yield Static(classes="gp-info")
+
+    def on_resize(self) -> None:
+        """Its text is cut to its size, so a new size needs a redraw (the tab shown, the window resized,
+        the cards placed anew). Every panel is as big as the first, so the first asks for all."""
+        if self.index == 0:
+            self.app.call_after_refresh(self.app.render_now)
+
+
+class GpuBox(VerticalScroll):
+    """The GPU tab: the cards side by side, as many across as fit, filling the screen. More cards than
+    fit across wrap into rows. A panel too short to show all it has keeps its height and the tab scrolls."""
+
+    MIN_W = 36                   # one card's panel: narrower shows too little
+
+    def __init__(self, count: int, min_height: Callable[[int], int], **kw) -> None:
+        super().__init__(Grid(*[GpuPanel(i) for i in range(count)], id="gpu-grid"), **kw)
+        self.min_height = min_height                   # a panel's content width -> the least height it needs
+        self.placed: tuple[int, int, int] | None = None
+
+    def on_resize(self) -> None:
+        self.place_cards()
+
+    def place_cards(self) -> None:
+        size = self.scrollable_content_region.size     # without the scrollbar, when there is one
+        panels = list(self.query(GpuPanel))
+        if not panels or size.width < 1 or size.height < 1:
+            return                                     # the tab is hidden
+        across = max(1, min(len(panels), size.width // self.MIN_W))
+        rows = math.ceil(len(panels) / across)
+        cols = math.ceil(len(panels) / rows)           # rows as even as can be: four cards 2 x 2, not 3 + 1
+        col_w = size.width // cols                     # every column as wide, so the graphs span the same time
+        least = self.min_height(col_w - panels[0].styles.gutter.width)
+        row_h = max(least, (size.height - (rows - 1)) // rows)   # a blank line between rows
+        if (cols, col_w, row_h) == self.placed:
+            return
+        self.placed = (cols, col_w, row_h)
+        grid = self.query_one("#gpu-grid", Grid)
+        grid.styles.grid_size_columns = cols
+        grid.styles.grid_columns = str(col_w)
+        grid.styles.grid_rows = str(row_h)
+        grid.styles.height = rows * row_h + rows - 1
+        for i, p in enumerate(panels):
+            p.set_class(i % cols > 0, "gp-right")      # a line on its left, like the Performance list's
+
+
 class EndTaskScreen(ModalScreen[str | None]):
     BINDINGS = [Binding("escape,q", "cancel", show=False), Binding("f", "force", show=False)]
 
@@ -1777,11 +1834,22 @@ def header1(label: str, is_sorted: bool, desc: bool, right: bool) -> Text:
     return Text(label + mark, justify="right" if right else "left", no_wrap=True)
 
 
-def info_grid(pairs: list[tuple[str, str]], width: int) -> Table:
+def info_cols(pairs: list[tuple[str, str]], width: int, tight: bool = False) -> int:
+    """How many columns info_grid uses. Normally every column is as wide as the widest cell; `tight`
+    lets each column be as wide as its own cells, with a smaller gap, so more fit in a narrow space."""
+    sizes = [max(Text(k).cell_len, Text(v).cell_len) for k, v in pairs]
+    if not tight:
+        return max(1, min(len(pairs), width // (max(sizes, default=10) + 3)))
+    for cols in range(len(pairs), 1, -1):
+        if sum(max(sizes[j::cols]) for j in range(cols)) + 2 * (cols - 1) <= width:
+            return cols
+    return 1
+
+
+def info_grid(pairs: list[tuple[str, str]], width: int, tight: bool = False, cols: int | None = None) -> Table:
     """Label above value, as in the lower half of Windows' Performance pages."""
-    cell_w = max((max(Text(k).cell_len, Text(v).cell_len) for k, v in pairs), default=10) + 3
-    cols = max(1, min(len(pairs), width // cell_w))
-    t = Table.grid(padding=(0, 3))
+    cols = cols or info_cols(pairs, width, tight)
+    t = Table.grid(padding=(0, 2 if tight else 3))
     for _ in range(cols):
         t.add_column(no_wrap=True)
     cells = [Text.assemble((k, "dim"), "\n", (v, "bold")) for k, v in pairs]
@@ -1804,7 +1872,8 @@ class TaskManager(App):
     CSS = """
     Screen { background: $background; }
     #topbar { height: 1; padding: 0 1; background: $panel; }
-    #topbar, #pd-title, #pd-info, .pi-body, Graph, CoreGrid { text-wrap: nowrap; text-overflow: ellipsis; }
+    #topbar, #pd-title, #pd-info, .pi-body, Graph, CoreGrid, .gp-title, .gp-info {
+        text-wrap: nowrap; text-overflow: ellipsis; }
     #search { display: none; margin: 0 1; }
     #tabs { height: 1fr; }
     #tabs TabPane { padding: 0; height: 1fr; }
@@ -1816,6 +1885,13 @@ class TaskManager(App):
     #pd-title { height: 1; margin-bottom: 1; }
     #pd-cores-box { height: 1fr; }
     #pd-info { height: auto; margin-top: 1; }
+    #gpu-box { height: 1fr; }
+    #gpu-grid { grid-gutter: 1 0; }
+    .gpu-panel { padding: 0 1 0 2; }
+    .gpu-panel.gp-right { border-left: solid $panel; padding: 0 1; }
+    .gp-title { height: 1; margin-bottom: 1; }
+    .gp-graph { min-height: 9; }
+    .gp-info { height: auto; margin-top: 1; }
     EndTaskScreen, HelpScreen { align: center middle; }
     #dialog { width: 80; max-width: 96%; height: auto; border: thick $error; background: $surface; padding: 1 2; }
     #dlg-title { margin-bottom: 1; }
@@ -1828,6 +1904,7 @@ class TaskManager(App):
         Binding("1", "tab('proc')", T["tab_proc"], show=False),
         Binding("2", "tab('perf')", T["tab_perf"], show=False),
         Binding("3", "tab('details')", T["tab_details"], show=False),
+        Binding("4", "tab('gpu')", T["tab_gpu"], show=False),
         Binding("slash", "search", T["b_search"], key_display="/"),
         Binding("delete", "end_task", T["b_end"], key_display="Del"),
         Binding("k", "end_task", T["b_end"], show=False),
@@ -1862,8 +1939,7 @@ class TaskManager(App):
 
     def perf_keys(self) -> list[str]:
         s = self.sampler
-        return (["cpu", "mem"] + [f"disk:{d.name}" for d in s.disks] + [f"nic:{n}" for n in s.nics]
-                + [f"gpu:{i}" for i in range(len(s.gpus.handles))])
+        return ["cpu", "mem"] + [f"disk:{d.name}" for d in s.disks] + [f"nic:{n}" for n in s.nics]
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar")
@@ -1882,6 +1958,9 @@ class TaskManager(App):
                         yield Static(id="pd-info")
             with TabPane(T["tab_details"], id="details"):
                 yield DataTable(id="details-table", cursor_type="row", fixed_columns=1)
+            if self.has_gpu:
+                with TabPane(T["tab_gpu"], id="gpu"):
+                    yield GpuBox(len(self.sampler.gpus.handles), self.gpu_min_height, id="gpu-box")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -1914,7 +1993,8 @@ class TaskManager(App):
             return "proc"
 
     def focus_tab(self) -> None:
-        target = {"proc": "#proc-table", "perf": "#perf-list", "details": "#details-table"}.get(self.active_tab)
+        target = {"proc": "#proc-table", "perf": "#perf-list", "details": "#details-table",
+                  "gpu": "#gpu-box"}.get(self.active_tab)
         if target:
             self.query_one(target).focus()
 
@@ -1923,6 +2003,8 @@ class TaskManager(App):
             return self.active_tab in ("proc", "details")
         if action == "cores":
             return self.active_tab == "perf"
+        if action == "tab" and parameters == ("gpu",):
+            return self.has_gpu
         return True
 
     # ----------------------------------------------------------- reading and drawing
@@ -1957,6 +2039,8 @@ class TaskManager(App):
             self.render_perf()
         elif tab == "details":
             self.render_details()
+        elif tab == "gpu":
+            self.render_gpu()
 
     def render_topbar(self) -> None:
         s = self.snap
@@ -2107,9 +2191,6 @@ class TaskManager(App):
         name = key.split(":", 1)[1]
         return next(n for n in self.snap.nics if n.name == name)
 
-    def _gpu(self, key: str) -> GpuInfo:
-        return self.snap.gpus[int(key.split(":", 1)[1])]
-
     def perf_item_text(self, key: str, w: int) -> Text:
         s, h = self.snap, self.history
         if key == "cpu":
@@ -2125,18 +2206,12 @@ class TaskManager(App):
             title, value = T["disk_n"].format(n=i), f"{d.active:.0f}%"
             sub = disk_type(d.dev) + (f"  {d.temp:.0f} °C" if d.temp is not None else f"  {d.dev.name}")
             spark = sparkline(h.get(f"disk.{d.dev.name}.active"), w, 100, COLORS["disk"])
-        elif key.startswith("nic:"):
+        else:
             n = self._nic(key)
             title, value = (T["wifi"] if n.wifi else T["ethernet"]), ""
             sub = f"{G.down} {fmt_rate(n.recv)}  {G.up} {fmt_rate(n.sent)}"
             both = [a + b for a, b in zip(h.get(f"nic.{n.name}.recv"), h.get(f"nic.{n.name}.sent"))]
             spark = sparkline(both, w, None, COLORS["net"])
-        else:
-            g = self._gpu(key)
-            title, value = T["gpu_n"].format(n=g.index), pct0(g.util)
-            temp = f"  {g.temp:.0f} °C" if g.temp is not None else ""
-            sub = f"{fmt_bytes(g.mem_used)} / {fmt_bytes(g.mem_total)}{temp}"
-            spark = sparkline(h.get(f"gpu{g.index}.util"), w, 100, COLORS["gpu"])
         text = Text(no_wrap=True, overflow="ellipsis")
         text.append_text(two_sided(Text(title, style="bold"), Text(value, style="bold"), w))
         text.append("\n")
@@ -2154,11 +2229,8 @@ class TaskManager(App):
         if key.startswith("disk:"):
             d, i = self._disk(key)
             return f"{T['disk_n'].format(n=i)} ({d.dev.name})", d.dev.model
-        if key.startswith("nic:"):
-            n = self._nic(key)
-            return (T["wifi"] if n.wifi else T["ethernet"]), n.name
-        g = self._gpu(key)
-        return T["gpu_n"].format(n=g.index), g.name
+        n = self._nic(key)
+        return (T["wifi"] if n.wifi else T["ethernet"]), n.name
 
     def perf_series(self, key: str) -> list[Series]:
         s, h = self.snap, self.history
@@ -2173,15 +2245,10 @@ class TaskManager(App):
                     Series(T["g_transfer"], [], None, None, "", parts=[
                         (T["lg_read"], h.get(pre + ".read"), COLORS["disk"]),
                         (T["lg_write"], h.get(pre + ".write"), COLORS["disk2"])])]
-        if key.startswith("nic:"):
-            n = self._nic(key)
-            return [Series(T["g_throughput"], [], None, None, "", parts=[
-                (T["lg_recv"], h.get(f"nic.{n.name}.recv"), COLORS["net"]),
-                (T["lg_send"], h.get(f"nic.{n.name}.sent"), COLORS["net2"])])]
-        g = self._gpu(key)
-        return [Series(T["g_util"], h.get(f"gpu{g.index}.util"), 100, "100%", COLORS["gpu"]),
-                Series(T["g_gpumem"], h.get(f"gpu{g.index}.mem"), g.mem_total or 1,
-                       fmt_bytes(g.mem_total), COLORS["gpu"])]
+        n = self._nic(key)
+        return [Series(T["g_throughput"], [], None, None, "", parts=[
+            (T["lg_recv"], h.get(f"nic.{n.name}.recv"), COLORS["net"]),
+            (T["lg_send"], h.get(f"nic.{n.name}.sent"), COLORS["net2"])])]
 
     def perf_info(self, key: str, width: int):
         s = self.snap
@@ -2224,35 +2291,12 @@ class TaskManager(App):
                 pairs.append((T["i_temp"], f"{d.temp:.0f} °C"))
             pairs += [(T["i_capacity"], fmt_bytes(d.dev.size)), (T["i_type"], disk_type(d.dev))]
             return RichGroup(info_grid(pairs, width), Text(""), self.disk_extra(d, width))
-        if key.startswith("nic:"):
-            n = self._nic(key)
-            pairs = [(T["i_recv"], fmt_rate(n.recv)), (T["i_sent"], fmt_rate(n.sent)),
-                     (T["i_link"], fmt_link(n.speed) if n.up else T["i_down"]), (T["i_adapter"], n.name),
-                     (T["i_ipv4"], ", ".join(n.ipv4) or G.dash), (T["i_ipv6"], n.ipv6[0] if n.ipv6 else G.dash),
-                     (T["i_total_recv"], fmt_bytes(n.total_recv)), (T["i_total_sent"], fmt_bytes(n.total_sent))]
-            return info_grid(pairs, width)
-        g = self._gpu(key)
-        pairs = [(T["i_util"], pct0(g.util)),
-                 (T["i_gpumem"], f"{fmt_bytes(g.mem_used)} / {fmt_bytes(g.mem_total)}"),
-                 (T["i_temp"], G.dash if g.temp is None else f"{g.temp:.0f} °C"),
-                 (T["i_power"], G.dash if g.power is None else
-                  f"{g.power:.0f} / {g.power_limit:.0f} W" if g.power_limit else f"{g.power:.0f} W"),
-                 (T["i_fan"], pct0(g.fan)),
-                 (T["i_sm"], G.dash if g.clock_sm is None else f"{g.clock_sm:,} MHz"),
-                 (T["i_memclk"], G.dash if g.clock_mem is None else f"{g.clock_mem:,} MHz"),
-                 (T["i_driver"], self.sampler.gpus.driver or G.dash)]
-        procs = Table.grid(padding=(0, 3))
-        for justify in ("left", "left", "right", "right"):
-            procs.add_column(no_wrap=True, justify=justify)
-        on_card = sorted(g.procs.items(), key=lambda kv: kv[1], reverse=True)
-        for pid, used in on_card[:8]:
-            p = s.procs.get(pid)
-            grp = self.group_of_pid(pid)
-            procs.add_row(Text(grp.label if grp else G.dash, style="bold"), Text(p.name if p else "?", style="dim"),
-                          Text(str(pid), style="dim"), Text(fmt_bytes(used)))
-        heading = Text(T["i_gpu_procs"] + ("" if on_card else f"：{T['i_none']}" if ARGS.lang == "zh"
-                                           else f": {T['i_none']}"), style="dim")
-        return RichGroup(info_grid(pairs, width), Text(""), heading, procs)
+        n = self._nic(key)
+        pairs = [(T["i_recv"], fmt_rate(n.recv)), (T["i_sent"], fmt_rate(n.sent)),
+                 (T["i_link"], fmt_link(n.speed) if n.up else T["i_down"]), (T["i_adapter"], n.name),
+                 (T["i_ipv4"], ", ".join(n.ipv4) or G.dash), (T["i_ipv6"], n.ipv6[0] if n.ipv6 else G.dash),
+                 (T["i_total_recv"], fmt_bytes(n.total_recv)), (T["i_total_sent"], fmt_bytes(n.total_sent))]
+        return info_grid(pairs, width)
 
     def disk_extra(self, d: DiskInfo, width: int):
         """Under a disk's numbers: how full each partition is, and the drive's health."""
@@ -2356,6 +2400,119 @@ class TaskManager(App):
         info = self.query_one("#pd-info", Static)
         info.update(self.perf_info(key, info.size.width or 80))
 
+    # ----------------------------------------------------------- the GPU tab
+
+    GRAPH_MIN = 9          # a card's graph at its smallest: per series a label and three rows, then the time axis
+    PROCS_MAX = 8          # processes listed under a card at most
+
+    def gpu_pairs(self, g: GpuInfo, widest: bool = False) -> list[tuple[str, str]]:
+        """A card's numbers. `widest`: each value as wide as it can get, to size the grid by, so the grid
+        keeps its shape while the numbers change."""
+        if widest:
+            g = replace(g, util=100.0, mem_used=1000 * MB, temp=100.0, power=g.power_limit or 1000.0, fan=100.0,
+                        clock_sm=99_999, clock_mem=99_999)
+        return [(T["i_util"], pct0(g.util)),
+                (T["i_vram"], f"{fmt_bytes(g.mem_used)} / {fmt_bytes(g.mem_total)}"),
+                (T["i_temp"], G.dash if g.temp is None else f"{g.temp:.0f} °C"),
+                (T["i_power"], G.dash if g.power is None else
+                 f"{g.power:.0f} / {g.power_limit:.0f} W" if g.power_limit else f"{g.power:.0f} W"),
+                (T["i_fan"], pct0(g.fan)),
+                (T["i_sm"], G.dash if g.clock_sm is None else f"{g.clock_sm:,} MHz"),
+                (T["i_memclk"], G.dash if g.clock_mem is None else f"{g.clock_mem:,} MHz"),
+                (T["i_driver"], self.sampler.gpus.driver or G.dash)]
+
+    def gpu_series(self, g: GpuInfo) -> list[Series]:
+        h = self.history
+        return [Series(T["g_util"], h.get(f"gpu{g.index}.util"), 100, "100%", COLORS["gpu"]),
+                Series(T["g_gpumem"], h.get(f"gpu{g.index}.mem"), g.mem_total or 1,
+                       fmt_bytes(g.mem_total), COLORS["gpu"])]
+
+    @staticmethod
+    def gpu_shown(g: GpuInfo, lines: int) -> tuple[list[tuple[int, int]], int]:
+        """The processes on a card that fit in `lines` lines, biggest first, and how many are left out
+        (then the last line says so)."""
+        on_card = sorted(g.procs.items(), key=lambda kv: kv[1], reverse=True)
+        if len(on_card) <= lines:
+            return on_card, 0
+        keep = max(0, lines - 1)
+        return on_card[:keep], len(on_card) - keep
+
+    @staticmethod
+    def gpu_procs(shown: list[tuple[int, int]], left_out: int, lines: int, names: dict[int, tuple[str, str]],
+                  widths: tuple[int, int | None, int]) -> list:
+        """A card's processes in exactly `lines` lines, blank ones filling up the rest. `names`: pid -> (its
+        app, its own name). `widths`: of the app, name and PID columns, the same on every card so the
+        columns line up; a name width of None leaves the names out."""
+        label_w, name_w, pid_w = widths
+        table = Table.grid(padding=(0, 2))
+        table.add_column(no_wrap=True, width=label_w)
+        if name_w is not None:
+            table.add_column(no_wrap=True, width=name_w)
+        table.add_column(no_wrap=True, justify="right", width=pid_w)
+        table.add_column(no_wrap=True, justify="right", width=7)   # fmt_bytes is at most 7 wide
+        for pid, used in shown:
+            label, name = names[pid]
+            cells = [Text(label, style="bold")] + ([Text(name, style="dim")] if name_w is not None else [])
+            table.add_row(*cells, Text(str(pid), style="dim"), Text(fmt_bytes(used)))
+        out: list = [table] if shown else []
+        if left_out:
+            out.append(Text(T["end_more"].format(n=left_out), style="dim"))
+        used_lines = len(shown) + (1 if left_out else 0)
+        return out + [Text("")] * max(0, lines - used_lines)
+
+    def gpu_grid(self, width: int) -> tuple[int, int]:
+        """(columns, lines) of the cards' numbers at this width: one shape for every card."""
+        cards = self.snap.gpus if self.snap else []
+        if not cards:
+            return 2, 8
+        cols = min(info_cols(self.gpu_pairs(g, widest=True), width, tight=True) for g in cards)
+        return cols, 2 * math.ceil(len(self.gpu_pairs(cards[0])) / cols)
+
+    def gpu_min_height(self, width: int) -> int:
+        """The least height a card's panel needs at this width: its title, the graph at its smallest, the
+        numbers, and the first two processes."""
+        return 2 + self.GRAPH_MIN + 1 + self.gpu_grid(width)[1] + 2 + 2
+
+    def render_gpu(self) -> None:
+        """Every card at once. All the panels are drawn alike, the numbers in the same grid and the process
+        lists padded to the same length, so their graphs are the same height and line up side by side."""
+        self.query_one("#gpu-box", GpuBox).place_cards()   # the least height can change once cards are read
+        cards = {g.index: g for g in self.snap.gpus}
+        panels = [(p, cards[p.index]) for p in self.query(GpuPanel) if p.index in cards]
+        if not panels:
+            return
+        width = panels[0][0].query_one(".gp-title", Static).size.width or 40
+        height = panels[0][0].size.height
+        cols, grid_lines = self.gpu_grid(width)
+        room = height - 2 - self.GRAPH_MIN - 1 - grid_lines - 2   # title, graph, blank, numbers, blank, heading
+        most = max(len(g.procs) for _, g in panels)
+        lines = min(most, self.PROCS_MAX, max(1, room))
+        shown = {g.index: self.gpu_shown(g, lines) for _, g in panels}
+        names = {}
+        for rows, _ in shown.values():
+            for pid, _ in rows:
+                p, grp = self.snap.procs.get(pid), self.group_of_pid(pid)
+                names[pid] = (grp.label if grp else G.dash, p.name if p else "?")
+        label_w = max((Text(a).cell_len for a, _ in names.values()), default=1)
+        name_w: int | None = max((Text(b).cell_len for _, b in names.values()), default=1)
+        pid_w = max((len(str(pid)) for pid in names), default=1)
+        fixed = pid_w + 7 + 2 * 2                  # the PID and memory columns, and the gaps before them
+        if width - fixed - name_w - 2 < min(label_w, 16):
+            name_w = None                          # the app's name comes first; the process's own if there is room
+        label_w = max(1, min(label_w, width - fixed - (0 if name_w is None else name_w + 2)))
+        for panel, g in panels:
+            title, name = T["gpu_n"].format(n=g.index), g.name
+            if len(title) + 1 + len(name) > width and name.startswith("NVIDIA "):
+                name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
+            head = panel.query_one(".gp-title", Static)
+            head.update(two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
+            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval)
+            heading = Text(T["i_gpu_procs"] + ("" if g.procs else f"：{T['i_none']}" if ARGS.lang == "zh"
+                                               else f": {T['i_none']}"), style="dim")
+            panel.query_one(".gp-info", Static).update(RichGroup(
+                info_grid(self.gpu_pairs(g), width, tight=True, cols=cols), Text(""), heading,
+                *self.gpu_procs(*shown[g.index], lines, names, (label_w, name_w, pid_w))))
+
     # ----------------------------------------------------------- events
 
     @on(TabbedContent.TabActivated, "#tabs")
@@ -2452,8 +2609,11 @@ class TaskManager(App):
 
     def action_help(self) -> None:
         projects = ", ".join(p.name for p in PROJECTS) or (G.dash if CONFIG_ERROR else T["cfg_none"])
-        self.push_screen(HelpScreen(T["help"].format(ncpu=self.sampler.ncpu, config=tilde(CONFIG_FILE),
-                                                     projects=projects)))
+        tabs = [T[k] for k in ("tab_proc", "tab_perf", "tab_details", "tab_gpu")[:4 if self.has_gpu else 3]]
+        self.push_screen(HelpScreen(T["help"].format(
+            ncpu=self.sampler.ncpu, config=tilde(CONFIG_FILE), projects=projects,
+            tab_keys="  ".join(t.split(" ", 1)[0] for t in tabs),
+            tab_names=("／" if ARGS.lang == "zh" else " / ").join(t.split(" ", 1)[1] for t in tabs))))
 
     def action_end_task(self) -> None:
         tab = self.active_tab

@@ -4,7 +4,7 @@
     venv/bin/pip install pillow
     venv/bin/python docs/make_screenshots.py
 
-The app runs headless on a fake sampler (a 16-core AMD desktop with one NVIDIA card, an NVMe SSD and a
+The app runs headless on a fake sampler (a 16-core AMD desktop with two NVIDIA cards, an NVMe SSD and a
 backup HDD), is fed two minutes of readings, then each page is painted cell by cell with the DejaVu
 fonts. Block characters are drawn as shapes, so the pictures line up whatever fonts the reader has.
 """
@@ -118,7 +118,7 @@ class Fake:
         for i in range(4):
             self.add(1950 + i, 1900, "bash", ["bash"], mb=5)
         self.add(3100, 1950, "claude", ["claude"], cpu=2.4, mb=286, threads=18)
-        self.add(3300, 1951, "python3", ["python3", "prepare_data.py", "--workers", "4"], cpu=368, mb=3420,
+        self.add(3300, 1951, "python3", ["python3", "train.py", "--workers", "4"], cpu=368, mb=3420,
                  threads=9, cwd="/home/alex/ml", disk=58 * MB)
         venv = "/home/alex/llm/venv/bin"
         vllm = [f"{venv}/python3", f"{venv}/vllm", "serve", "meta-llama/Llama-3.1-8B-Instruct", "--port", "8000",
@@ -135,8 +135,8 @@ class Fake:
 
 
 class FakeGpus:
-    handles = [None]
-    names = ["NVIDIA GeForce RTX 4090"]
+    handles = [None, None]
+    names = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090"]
     driver = "570.133.07"
 
     def close(self) -> None:
@@ -172,18 +172,19 @@ class FakeSampler(tm.Sampler):
         job = min(1.0, max(0.15, 0.6 + 0.45 * w(11) + 0.1 * r.uniform(-1, 1)))   # the data job, in waves
         serve = min(1.0, max(0.3, 0.75 + 0.25 * w(7, 1.3) + 0.08 * r.uniform(-1, 1)))  # vLLM, by requests
         load = {3300: job, 3500: serve, 3561: serve}
+        train = min(100.0, 40 + 58 * job + 3 * r.uniform(-1, 1))   # the training job on the second card
         procs = {}
         for pid, ppid, name, uid, user, cmd, threads, cpu, mb, cwd, disk in self.fake.rows:
             kernel = pid == 2 or ppid == 2
             c = cpu * load[pid] if pid in load else cpu * (1 + 0.4 * r.uniform(-1, 1))
             gpu = {0: int(19.6 * GB)} if pid == 3561 else {0: 210 * MB} if pid == 1850 else {}
-            gpu = {0: 180 * MB} if pid == 2400 else gpu
+            gpu = {0: 180 * MB} if pid == 2400 else {1: int(17.8 * GB)} if pid == 3300 else gpu
             procs[pid] = tm.Proc(
                 pid=pid, ppid=ppid, ct=float(pid), name=name, uid=uid, user=user, status="running" if c > 50 else "sleeping",
                 threads=threads, cmdline=cmd, cpu=max(0.0, c) / NCPU, mem=None if kernel else int(mb * MB),
                 disk=None if kernel or uid != ME else disk * (0.6 + burst + 0.3 * r.random()),
                 gpu_mem=gpu, gpu_util=min(100.0, 95 * serve + 3 * r.uniform(-1, 1)) if pid == 3561
-                else 1.0 if pid == 2400 else 0.0, cwd=cwd)
+                else train if pid == 3300 else 1.0 if pid == 2400 else 0.0, cwd=cwd)
         times, freq = [], []
         hot = {cpu: pct * load.get(pid, 1.0) for pid, _, cpu, pct in HOT}
         for i in range(NCPU):
@@ -216,10 +217,13 @@ class FakeSampler(tm.Sampler):
                         space=[("/mnt/backup", int(2.61 * 1024 * GB), int(3.64 * 1024 * GB), 71.7)])]
         nics = [tm.NicInfo("enp6s0", False, True, 2500, ["192.168.1.42"], ["fe80::2e0:4cff:fe68:1f2a"], recv, sent,
                            int(self.totals["enp6s0"][0] + recv * self.k), int(self.totals["enp6s0"][1] + sent * self.k))]
-        on_card = {pid: p.gpu_mem[0] for pid, p in procs.items() if p.gpu_mem}
-        gpus = [tm.GpuInfo(0, FakeGpus.names[0], g, sum(on_card.values()) + 310 * MB, 24 * GB, 64 + 3 * w(30),
+        on = [{pid: p.gpu_mem[i] for pid, p in procs.items() if i in p.gpu_mem} for i in (0, 1)]
+        gpus = [tm.GpuInfo(0, FakeGpus.names[0], g, sum(on[0].values()) + 310 * MB, 24 * GB, 64 + 3 * w(30),
                            290 + 40 * w(4) + 10 * r.random(), 450.0, 47 + 3 * w(30), int(2610 + 60 * w(6)), 10501,
-                           on_card)]
+                           on[0]),
+                tm.GpuInfo(1, FakeGpus.names[1], train, sum(on[1].values()) + 260 * MB, 24 * GB, 71 + 2 * w(25, 0.7),
+                           300 + 30 * w(5, 2.0) + 8 * r.random(), 350.0, 62 + 4 * w(25, 0.7),
+                           int(1830 + 45 * w(7, 1.0)), 9751, on[1])]
         user_procs = [p for p in procs.values() if not p.kernel]
         return tm.Snapshot(
             t=1773494525.0 + self.k, cpu=cpu, freq=sum(freq) / NCPU, freq_max=5881.0,
@@ -330,7 +334,7 @@ async def shoot(names: list[str]) -> None:
         await snap("cores")
         await pilot.press("l", "down", "down")
         await snap("disk")
-        await pilot.press("down", "down", "down")
+        await pilot.press("4")
         await snap("gpu")
 
 

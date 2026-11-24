@@ -3,8 +3,8 @@
 [繁體中文](README.zh-TW.md)
 
 A task manager for the terminal, laid out like the one in Windows: processes grouped by app, graphs
-over time for the CPU, memory, each disk, each network adapter and each NVIDIA GPU, and a view of what
-every CPU core is doing.
+over time for the CPU, memory, each disk and each network adapter, every NVIDIA GPU side by side on a
+tab of its own, and a view of what every CPU core is doing.
 
 ![The Processes tab](docs/processes.png)
 
@@ -16,7 +16,7 @@ row of its own. Rows are sorted into Apps, Background processes and System proce
 CPU, memory, disk and, with an NVIDIA card, GPU and GPU memory, with the machine's totals above the
 column names. Enter expands a group, and Del ends a task after asking (SIGTERM, or SIGKILL to force).
 
-**Performance**: CPU, memory, each disk, each network adapter and each GPU, every one with a graph.
+**Performance**: CPU, memory, each disk and each network adapter, every one with a graph.
 
 ![The Performance tab](docs/performance.png)
 
@@ -35,12 +35,15 @@ column names. Enter expands a group, and Del ends a task after asking (SIGTERM, 
   ![A disk](docs/disk.png)
 
 - **Network**: receive and send stacked in one graph, link speed, addresses and totals.
-- **GPU** (NVIDIA, through NVML): use, memory, temperature, power, fan, clocks, and the processes on
-  the card with how much memory each holds.
-
-  ![A GPU](docs/gpu.png)
 
 **Details**: one row per process, with PID, status, user, threads and command line.
+
+**GPU** (NVIDIA, through NVML): every card at once, side by side. Each one has graphs of its use and
+memory over the same span of time, its temperature, power, fan and clocks, and the processes on it with
+how much memory each holds. Cards that do not fit across the window wrap into rows, and the tab
+scrolls when the window is too small for them. The tab is there only when an NVIDIA card is.
+
+![The GPU tab](docs/gpu.png)
 
 ## Requirements
 
@@ -74,7 +77,7 @@ taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 
 | Key | |
 |---|---|
-| `1` `2` `3` | Processes / Performance / Details (or click the tabs) |
+| `1` `2` `3` `4` | Processes / Performance / Details / GPU (or click the tabs) |
 | Up, Down, PgUp, PgDn | move |
 | Enter | expand or collapse a group or section (mouse: click to select, click again to expand) |
 | `/` | search by name, PID or command line; Esc clears |
