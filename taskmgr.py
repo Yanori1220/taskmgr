@@ -93,6 +93,7 @@ HELP_ZH = """\
   Del 或 k         結束工作（會先問）
   l                效能分頁的 CPU：整體／每個核心的工作狀態（使用率分成程式、系統核心、等待 I/O，
                    加上頻率，和最忙的核心上在跑的程式）
+  z                效能和 GPU 分頁：圖涵蓋多長的時間：每格一次讀數／5 分鐘／15 分鐘
   空白鍵           暫停／繼續更新
   q 或 Ctrl+C      離開
   要選取畫面上的字：按住 Shift 再用滑鼠拖
@@ -132,6 +133,8 @@ Keys
   Del or k         end task (asks first)
   l                Performance tab, CPU: overall / what each core is doing (use split into programs,
                    kernel and I/O wait, its clock, and the programs on the busiest cores)
+  z                Performance and GPU tabs: how much time the graphs cover: one reading to a
+                   column / 5 minutes / 15 minutes
   Space            pause / resume updates
   q or Ctrl+C      quit
   To select text on screen, hold Shift while dragging
@@ -200,6 +203,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "i_down": "未連線", "i_vram": "記憶體", "i_temp": "溫度", "i_power": "功耗",
         "i_fan": "風扇", "i_sm": "核心時脈", "i_memclk": "記憶體時脈", "i_driver": "驅動程式版本",
         "i_gpu_procs": "使用這張卡的程式", "i_none": "沒有",
+        "b_zoom": "時間範圍", "minutes": "{n} 分鐘",
         "cores_hint": "l：看每個核心的工作狀態", "cores_back": "l：回到整體",
         "lg_user": "程式", "lg_sys": "系統核心", "lg_iow": "等待 I/O", "lg_cell": "每格：邏輯處理器　使用率　頻率 GHz",
         "lg_pairs": "同一個實體核心的兩個執行緒排在一起：{a} 和 {b}、{c} 和 {d}……",
@@ -257,6 +261,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "i_vram": "Memory", "i_temp": "Temperature", "i_power": "Power", "i_fan": "Fan",
         "i_sm": "Core clock", "i_memclk": "Memory clock", "i_driver": "Driver version",
         "i_gpu_procs": "Processes on this GPU", "i_none": "none",
+        "b_zoom": "Time span", "minutes": "{n} minutes",
         "cores_hint": "l: what each core is doing", "cores_back": "l: back to overall",
         "lg_user": "programs", "lg_sys": "kernel", "lg_iow": "I/O wait", "lg_cell": "each cell: logical processor, use, clock GHz",
         "lg_pairs": "the two threads of one physical core sit together: {a} and {b}, {c} and {d}...",
@@ -476,6 +481,27 @@ def stacked_bar(parts: list[tuple[float, str]], width: int) -> Text:
         else:
             out.add(G.hblocks[n], Style(color=first, bgcolor=cells[n] or TRACK))
     return out.done()
+
+
+def resample(values: list, width: int, per: float, total: int) -> list:
+    """`values`, the last of `total` readings (oldest first), as `width` columns of `per` readings each,
+    the newest at the right. A column holds the mean of its readings, or, narrower than one reading, the
+    reading at that moment; None before the oldest. Each column holds a fixed stretch of time, so the
+    picture moves one column at a time instead of shimmering with every reading."""
+    n = len(values)
+    first = total - n                          # the number of values[0], counting every reading ever taken
+    newest = math.floor((total - 1) / per)     # the column the newest reading falls in
+    out = []
+    for c in range(width):
+        b = newest - (width - 1 - c)
+        a0, a1 = math.ceil(b * per), math.ceil((b + 1) * per)
+        if a1 <= a0:
+            i = math.floor(b * per) - first
+            out.append(values[i] if 0 <= i < n else None)
+            continue
+        got = [v for v in values[max(0, a0 - first):max(0, min(n, a1 - first))] if v is not None]
+        out.append(sum(got) / len(got) if got else None)
+    return out
 
 
 def area_rows(values: list, width: int, rows: int, vmax: float, color: str) -> list[Text]:
@@ -1475,6 +1501,7 @@ class History:
     def __init__(self, size: int = 900) -> None:
         self.size = size
         self.data: dict[str, deque] = {}
+        self.count = 0                 # readings pushed so far
 
     def add(self, key: str, value: float | None) -> None:
         d = self.data.get(key)
@@ -1486,6 +1513,7 @@ class History:
         return list(self.data.get(key, ()))
 
     def push(self, s: Snapshot) -> None:
+        self.count += 1
         self.add("cpu", s.cpu)
         self.add("mem", s.vm.percent)
         for g in s.gpus:
@@ -1521,31 +1549,39 @@ class Graph(Widget):
         super().__init__(**kw)
         self.series: list[Series] = []
         self.step = 1.0
+        self.span: float | None = None   # seconds across; None: one reading to a column
+        self.total = 0                   # readings taken so far (the history keeps the last of them)
 
-    def set_series(self, series: list[Series], step: float) -> None:
-        self.series, self.step = series, step
+    def set_series(self, series: list[Series], step: float, span: float | None = None, total: int = 0) -> None:
+        self.series, self.step, self.span, self.total = series, step, span, total
         self.refresh()
 
     def render(self) -> Text:
         w, h = self.size.width, self.size.height
         if not self.series or w < 8 or h < 3:
             return Text("")
+        if self.span and self.total:
+            per_col = self.span / self.step / w
+            fit = lambda values: resample(values, w, per_col, self.total)  # noqa: E731
+        else:
+            fit = lambda values: values[-w:]  # noqa: E731
         lines: list[Text] = []
         per = (h - 1) // len(self.series)
         for s in self.series:
             if s.parts:                         # stacked parts, scaled to the peak of their sum
-                sums = [sum(v or 0 for v in col) for col in zip(*(values[-w:] for _, values, _ in s.parts))]
+                parts = [(name, fit(values), color) for name, values, color in s.parts]
+                sums = [sum(v or 0 for v in col) for col in zip(*(values for _, values, _ in parts))]
                 vmax = nice_ceil(max(sums, default=0))
                 label = Text(s.label, style="dim")
-                for name, _, color in s.parts:
+                for name, _, color in parts:
                     label.append("   ")
                     label.append(G.bar[0], color)
                     label.append(" " + name, "dim")
                 lines.append(two_sided(label, Text(fmt_rate(vmax), style="dim"), w))
                 if per - 1 >= 1:
-                    lines.extend(stacked_area_rows([(values, color) for _, values, color in s.parts], w, per - 1, vmax))
+                    lines.extend(stacked_area_rows([(values, color) for _, values, color in parts], w, per - 1, vmax))
                 continue
-            vals = s.values[-w:]
+            vals = fit(s.values)
             vmax, top = s.vmax, s.top
             if vmax is None:
                 vmax = nice_ceil(max((v for v in vals if v is not None), default=0))
@@ -1555,7 +1591,10 @@ class Graph(Widget):
                 lines.extend(area_rows(vals, w, per - 1, vmax, s.color))
         while len(lines) < h - 1:
             lines.append(Text(""))
-        span = T["seconds"].format(n=fmt_secs(w * self.step))
+        if self.span and self.total:
+            span = T["minutes"].format(n=fmt_secs(self.span / 60))
+        else:
+            span = T["seconds"].format(n=fmt_secs(w * self.step))
         lines.append(two_sided(Text(span, style="dim"), Text("0", style="dim"), w))
         return Text("\n", no_wrap=True, overflow="ellipsis").join(lines)
 
@@ -1754,6 +1793,7 @@ class Col:
     width: int
 
 
+SPANS = (None, 300, 900)   # z steps through these: one reading to a column, 5 minutes, 15 minutes
 PROC_COLS = ("cpu", "mem", "disk", "gpu", "gpumem")
 PROC_W = {"cpu": 8, "mem": 10, "disk": 10, "gpu": 6, "gpumem": 15}
 DET_COLS = ("pid", "status", "user", "cpu", "mem", "threads", "gpumem", "cmd")
@@ -1911,6 +1951,7 @@ class TaskManager(App):
         Binding("s", "sort_next", T["b_sort"]),
         Binding("r", "sort_reverse", T["b_reverse"]),
         Binding("l", "cores", T["b_cores"]),
+        Binding("z", "zoom", T["b_zoom"]),
         Binding("space", "pause", T["b_pause"], key_display=T["k_space"]),
         Binding("question_mark", "help", T["b_help"], key_display="?"),
         Binding("escape", "escape", show=False),
@@ -1924,7 +1965,7 @@ class TaskManager(App):
         self.interval = interval
         self.has_gpu = bool(sampler.gpus.handles)
         self.snap: Snapshot | None = None
-        self.history = History()
+        self.history = History(math.ceil(max(s for s in SPANS if s) / interval * 1.1) + 10)  # the longest span
         self.paused = False
         self._busy = False
         self._last_error: str | None = None
@@ -1934,6 +1975,7 @@ class TaskManager(App):
         self.collapsed: set[str] = set()
         self.perf_sel = "cpu"
         self.show_cores = False
+        self.span: float | None = None      # seconds the graphs cover; None: one reading to a column
 
     # ----------------------------------------------------------- layout
 
@@ -2001,6 +2043,8 @@ class TaskManager(App):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action in ("search", "end_task", "sort_next", "sort_reverse"):
             return self.active_tab in ("proc", "details")
+        if action == "zoom":
+            return self.active_tab in ("perf", "gpu")
         if action == "cores":
             return self.active_tab == "perf"
         if action == "tab" and parameters == ("gpu",):
@@ -2396,7 +2440,7 @@ class TaskManager(App):
             self.query_one("#pd-cores", CoreGrid).set_data(self.sampler.cpu_groups, self.snap.per_cpu_times,
                                                            self.snap.per_cpu_freq)
         else:
-            graph.set_series(self.perf_series(key), self.interval)
+            graph.set_series(self.perf_series(key), self.interval, self.span, self.history.count)
         info = self.query_one("#pd-info", Static)
         info.update(self.perf_info(key, info.size.width or 80))
 
@@ -2506,7 +2550,7 @@ class TaskManager(App):
                 name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
             head = panel.query_one(".gp-title", Static)
             head.update(two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
-            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval)
+            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval, self.span, self.history.count)
             heading = Text(T["i_gpu_procs"] + ("" if g.procs else f"：{T['i_none']}" if ARGS.lang == "zh"
                                                else f": {T['i_none']}"), style="dim")
             panel.query_one(".gp-info", Static).update(RichGroup(
@@ -2595,6 +2639,11 @@ class TaskManager(App):
         if tab in self.sort:
             col, desc = self.sort[tab]
             self.sort[tab] = (col, not desc)
+            self.render_now()
+
+    def action_zoom(self) -> None:
+        self.span = SPANS[(SPANS.index(self.span) + 1) % len(SPANS)]
+        if self.snap:
             self.render_now()
 
     def action_cores(self) -> None:

@@ -84,6 +84,7 @@ taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 | `s` / `r` | next sort column / reverse it (or click a column name) |
 | Del or `k` | end task (asks first) |
 | `l` | on the CPU page: overall / each core |
+| `z` | Performance and GPU tabs: the graphs cover one reading per column, 5 minutes or 15 minutes |
 | Space | pause / resume |
 | `?` | help |
 | `q` or Ctrl+C | quit |
