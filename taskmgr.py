@@ -27,6 +27,7 @@ import re
 import signal
 import socket
 import subprocess
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -1102,6 +1103,8 @@ class Gpus:
         self.handles: list = []
         self.names: list[str] = []
         self.driver = ""
+        self.lock = threading.Lock()   # a reading (in the worker thread) and close() never overlap
+        self.closed = False
         if nv is None:
             return
         try:
@@ -1122,10 +1125,23 @@ class Gpus:
             return None
 
     def close(self) -> None:
-        if self.handles:
-            self._call(nv.nvmlShutdown)
+        """Shuts NVML down once no reading is using it: a reading still running when NVML shuts down
+        hangs or crashes inside NVIDIA's library. Readings after this find no cards. A reading takes
+        milliseconds; if one hangs instead, NVML is left to the end of the process."""
+        self.closed = True
+        if not self.lock.acquire(timeout=2):
+            return
+        try:
+            if self.handles:
+                self._call(nv.nvmlShutdown)
+        finally:
+            self.lock.release()
 
     def sample(self) -> tuple[list[GpuInfo], dict[int, dict[int, int]], dict[int, dict[int, float]]]:
+        with self.lock:
+            return ([], {}, {}) if self.closed else self._sample()
+
+    def _sample(self) -> tuple[list[GpuInfo], dict[int, dict[int, int]], dict[int, dict[int, float]]]:
         infos: list[GpuInfo] = []
         mem_by_pid: dict[int, dict[int, int]] = {}
         util_by_pid: dict[int, dict[int, float]] = {}
