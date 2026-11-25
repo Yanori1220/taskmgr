@@ -76,8 +76,8 @@ Run it with `./taskmgr`, or link it onto your PATH: `ln -s "$PWD/taskmgr" ~/.loc
 ## Use
 
 ```
-taskmgr                  refresh every second
-taskmgr --interval 2     refresh every 2 seconds
+taskmgr                  refresh at the speed last chosen with u (at first, every second)
+taskmgr --interval 2     refresh every 2 seconds this time
 taskmgr --lang zh        Traditional Chinese labels
 taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 ```
@@ -95,11 +95,15 @@ taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 | `v` | GPU tab: one, two (side by side) or four (2 × 2) cards a page |
 | `←` `→` | GPU tab: the other cards |
 | mouse wheel, Tab | GPU tab: scroll a card's process list; Tab moves to the next card's list, whose arrow keys then scroll it |
+| `u` | update speed: a reading every 0.5, 1, 2 or 4 seconds (the top bar shows which); the graphs keep what they have drawn |
 | Space | pause / resume |
 | `?` | help |
 | `q` or Ctrl+C | quit |
 
 To select text on the screen, hold Shift while you drag.
+
+The speed picked with `u` is kept in `~/.config/taskmgr/settings.toml` (under `$XDG_CONFIG_HOME` if that
+is set) for the next start; `--interval` overrides it for one run.
 
 ## Group your own projects
 
@@ -145,7 +149,8 @@ groups stay off until the file is fixed.
 ## Cost
 
 It reads `/proc` itself instead of creating psutil objects for every process. On a 64-thread desktop,
-one reading takes about 30 ms, and the app uses 4–7% of one core and about 80 MB of memory.
+one reading takes about 30 ms. At one reading a second the app uses 4–7% of one core and about 80 MB of
+memory; every 0.5 seconds, about twice the CPU.
 
 ## Notes
 

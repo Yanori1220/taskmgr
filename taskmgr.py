@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Task Manager in the terminal, laid out like the Windows one. Linux only.
 
-    taskmgr                  refresh every second
-    taskmgr --interval 2     refresh every 2 seconds
+    taskmgr                  refresh at the speed last chosen with u (at first, every second)
+    taskmgr --interval 2     refresh every 2 seconds this time
     taskmgr --lang zh        Chinese labels (not on the Linux console, Ctrl+Alt+F3: it has no CJK font)
     taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import json
 import math
 import os
@@ -32,6 +33,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -41,6 +43,7 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import on
+from textual.actions import parse as parse_action
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
@@ -63,11 +66,19 @@ except ModuleNotFoundError:  # before Python 3.11: groups.toml cannot be read
 
 # ---------------------------------------------------------------- arguments, language, glyphs
 
+def clean_interval(value: object) -> float | None:
+    """Seconds between readings as the app uses them: at least 0.25, to the millisecond. None when `value`
+    is not a number of seconds (text, true / false, infinity, NaN)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return max(0.25, round(float(value), 3))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="taskmgr",
                                  description="Task Manager in the terminal, laid out like the Windows one.")
-    ap.add_argument("--interval", type=float, default=1.0, metavar="SEC",
-                    help="seconds between updates (default 1)")
+    ap.add_argument("--interval", type=float, metavar="SEC",
+                    help="seconds between updates this time (default: the speed last chosen with u, at first 1)")
     ap.add_argument("--lang", choices=("zh", "en"),
                     help="label language (default en)")
     ap.add_argument("--ascii", action="store_true",
@@ -76,7 +87,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     on_console = os.environ.get("TERM") == "linux"  # Ctrl+Alt+F3: few block characters
     args.lang = args.lang or "en"
     args.ascii = args.ascii or on_console
-    args.interval = max(0.25, args.interval)
+    if args.interval is not None:          # None: not given, so the saved speed or 1 s (see main)
+        args.interval = clean_interval(args.interval)
+        if args.interval is None:
+            ap.error("--interval needs a number of seconds, such as 0.5 or 2")
     return args
 
 
@@ -96,6 +110,8 @@ HELP_ZH = """\
   z                效能和 GPU 分頁：圖涵蓋多長的時間：每格一次讀數／5 分鐘／15 分鐘
   v                GPU 分頁：一頁放幾張卡：1／2（並排）／4（2×2）
   ← →              GPU 分頁：換到其他卡（一頁一張時就是上一張、下一張）
+  u                更新速度：每 {speeds} 秒讀一次（現在 {now} 秒），
+                   下次開會沿用（有給 --interval 時以它為準）
   空白鍵           暫停／繼續更新
   q 或 Ctrl+C      離開
   要選取畫面上的字：按住 Shift 再用滑鼠拖
@@ -152,6 +168,8 @@ Keys
                    column / 5 minutes / 15 minutes
   v                GPU tab: cards a page: 1 / 2 (side by side) / 4 (2 x 2)
   Left Right       GPU tab: the other cards (with one a page, the one before or after)
+  u                update speed: a reading every {speeds} seconds (now {now}),
+                   kept for the next start (--interval overrides it)
   Space            pause / resume updates
   q or Ctrl+C      quit
   To select text on screen, hold Shift while dragging
@@ -241,6 +259,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "sl_clocks": "時脈設定", "sl_display": "顯示時脈", "sl_sync": "同步加速", "sl_board": "板卡限制",
         "sl_reliability": "可靠性",
         "b_zoom": "時間範圍", "minutes": "{n} 分鐘", "b_view": "每頁幾張", "b_cards": "切換顯示卡",
+        "b_speed": "更新速度", "speed": "每 {n} 秒更新",
         "cores_hint": "l：看每個核心的工作狀態", "cores_back": "l：回到整體",
         "lg_user": "程式", "lg_sys": "系統核心", "lg_iow": "等待 I/O", "lg_cell": "每格：邏輯處理器　使用率　頻率 GHz",
         "lg_pairs": "同一個實體核心的兩個執行緒排在一起：{a} 和 {b}、{c} 和 {d}……",
@@ -257,6 +276,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "sample_error": "讀取失敗：{err}", "help": HELP_ZH,
         "cfg_error": "讀不了 {path}：{err}　專案分組先關掉", "cfg_none": "還沒設定",
         "cfg_python": "要 Python 3.11 以上才讀得了",
+        "set_error": "讀不了 {path}：{err}　先用每 1 秒更新", "save_error": "存不了更新速度到 {path}：{err}",
     },
     "en": {
         "title": "Task Manager", "paused": "Paused   Space resumes",
@@ -304,6 +324,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "sl_brake": "power brake", "sl_clocks": "app clocks", "sl_display": "display",
         "sl_sync": "sync boost", "sl_board": "board limit", "sl_reliability": "reliability",
         "b_zoom": "Time span", "minutes": "{n} minutes", "b_view": "Cards a page", "b_cards": "Other cards",
+        "b_speed": "Update speed", "speed": "Updates every {n} s",
         "cores_hint": "l: what each core is doing", "cores_back": "l: back to overall",
         "lg_user": "programs", "lg_sys": "kernel", "lg_iow": "I/O wait", "lg_cell": "each cell: logical processor, use, clock GHz",
         "lg_pairs": "the two threads of one physical core sit together: {a} and {b}, {c} and {d}...",
@@ -320,6 +341,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "sample_error": "Reading failed: {err}", "help": HELP_EN,
         "cfg_error": "Could not read {path}: {err}. Project groups are off.", "cfg_none": "none set",
         "cfg_python": "it needs Python 3.11 or newer",
+        "set_error": "Could not read {path}: {err}. Updating every 1 s for now.",
+        "save_error": "Could not save the update speed to {path}: {err}",
     },
 }
 
@@ -351,6 +374,7 @@ G = Glyphs(ARGS.ascii)
 
 HOME = Path.home()
 CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "taskmgr" / "groups.toml"
+SETTINGS_FILE = CONFIG_FILE.with_name("settings.toml")   # what the app keeps for its next start: the update speed
 MB, GB = 1 << 20, 1 << 30
 
 COLORS = {"cpu": "#4aa3df", "mem": "#b46ee6", "disk": "#6ab04c", "disk2": "#e5c07b",
@@ -525,24 +549,36 @@ def stacked_bar(parts: list[tuple[float, str]], width: int) -> Text:
     return out.done()
 
 
-def resample(values: list, width: int, per: float, total: int) -> list:
-    """`values`, the last of `total` readings (oldest first), as `width` columns of `per` readings each,
-    the newest at the right. A column holds the mean of its readings, or, narrower than one reading, the
-    reading at that moment; None before the oldest. Each column holds a fixed stretch of time, so the
-    picture moves one column at a time instead of shimmering with every reading."""
-    n = len(values)
-    first = total - n                          # the number of values[0], counting every reading ever taken
-    newest = math.floor((total - 1) / per)     # the column the newest reading falls in
+def resample(values: list, at: list[int], width: int, col: Fraction) -> list:
+    """`values` (oldest first), read at the times `at` (in ms; the two lists end together), as `width`
+    columns of `col` ms each, the newest at the right. A column holds the mean of the readings in it, or,
+    when it falls between two readings, the one before it; None before the oldest. Each column holds a
+    fixed stretch of time, so the picture moves one column at a time instead of shimmering with every
+    reading, and readings taken at another update speed keep their place in time. `col` is a fraction and
+    the sums are in whole numbers, so a reading right on the edge of a column always lands on the same side."""
+    n = min(len(values), len(at))
+    if not n or width < 1:
+        return [None] * max(0, width)
+    values, at = values[len(values) - n:], at[len(at) - n:]
+    num, den = col.numerator, col.denominator       # a column is num / den ms: reading t is in column t * den // num
+    left = at[-1] * den // num - (width - 1)        # the first column's number: the newest reading is in the last
+    cols: dict[int, list] = {}
+    prev, seen = None, False                        # the reading before the current column, if there is one
+    for k in range(max(0, bisect.bisect_left(at, -(-left * num // den)) - 1), n):
+        c = at[k] * den // num - left
+        if c < 0:
+            prev, seen = values[k], True
+        else:
+            cols.setdefault(c, []).append(values[k])
     out = []
     for c in range(width):
-        b = newest - (width - 1 - c)
-        a0, a1 = math.ceil(b * per), math.ceil((b + 1) * per)
-        if a1 <= a0:
-            i = math.floor(b * per) - first
-            out.append(values[i] if 0 <= i < n else None)
+        got = cols.get(c)
+        if got is None:
+            out.append(prev if seen else None)
             continue
-        got = [v for v in values[max(0, a0 - first):max(0, min(n, a1 - first))] if v is not None]
-        out.append(sum(got) / len(got) if got else None)
+        nums = [v for v in got if v is not None]
+        out.append(sum(nums) / len(nums) if nums else None)
+        prev, seen = got[-1], True
     return out
 
 
@@ -874,6 +910,48 @@ def load_projects(path: Path = CONFIG_FILE) -> tuple[list[Project], str | None]:
 
 
 PROJECTS, CONFIG_ERROR = load_projects()
+
+
+def load_interval(path: Path = SETTINGS_FILE) -> tuple[float | None, str | None]:
+    """The update speed last chosen with u (None: none yet), and what went wrong reading it (None: nothing)."""
+    try:
+        if not path.exists():
+            return None, None
+        if tomllib is None:
+            return None, T["set_error"].format(path=tilde(path), err=T["cfg_python"])
+        value = tomllib.loads(path.read_text()).get("interval")
+        if value is None:
+            return None, None
+        seconds = clean_interval(value)
+        if seconds is None:
+            raise ValueError(f"interval = {value!r} is not a number of seconds")
+        return seconds, None
+    except (OSError, ValueError) as e:     # TOMLDecodeError is a ValueError
+        return None, T["set_error"].format(path=tilde(path), err=getattr(e, "strerror", None) or e)
+
+
+def save_interval(seconds: float, path: Path = SETTINGS_FILE) -> str | None:
+    """Keeps the update speed for the next start; returns what went wrong, or None. The file is written
+    whole under another name and then renamed into place, so it is never seen half written; a link to a
+    file elsewhere (dotfiles) stays a link."""
+    text = ("# Task Manager keeps the update speed last chosen with u here (seconds between readings),\n"
+            "# for its next start. --interval on the command line overrides it for that run.\n"
+            f"interval = {float(seconds)!r}\n")
+    part = None
+    try:
+        real = path.resolve()                  # RuntimeError: links in a loop (before Python 3.13)
+        part = real.with_name(f".{real.name}.{os.getpid()}")
+        real.parent.mkdir(parents=True, exist_ok=True)
+        part.write_text(text)
+        os.replace(part, real)
+    except (OSError, RuntimeError) as e:
+        if part is not None:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return T["save_error"].format(path=tilde(path), err=getattr(e, "strerror", None) or e)
+    return None
 
 
 def project_rule(p: Proc) -> tuple[str, str, str] | None:
@@ -1606,24 +1684,32 @@ class Sampler:
 
 
 class History:
-    """The last readings of every graphed number, newest last."""
+    """The last readings of every graphed number, newest last, and the time each one stands at, in ms.
+    That time moves on by the update interval with every reading, whatever the clock did in between (a
+    pause takes no room), so at one reading to a column a graph has neither gaps nor doubles; after a
+    change of update speed, the readings from before keep their place in time."""
 
-    def __init__(self, size: int = 900) -> None:
-        self.size = size
+    def __init__(self, keep: float, keep_min: int = 500) -> None:
+        self.keep = keep * 1000        # ms: what the longest span needs ...
+        self.keep_min = keep_min       # ... or this many readings, if they reach further back (slow updates)
+        self.at: deque[int] = deque()
         self.data: dict[str, deque] = {}
-        self.count = 0                 # readings pushed so far
 
     def add(self, key: str, value: float | None) -> None:
         d = self.data.get(key)
         if d is None:
-            d = self.data[key] = deque(maxlen=self.size)
+            d = self.data[key] = deque()
         d.append(value)
 
     def get(self, key: str) -> list:
         return list(self.data.get(key, ()))
 
-    def push(self, s: Snapshot) -> None:
-        self.count += 1
+    def times(self) -> list[int]:
+        return list(self.at)
+
+    def push(self, s: Snapshot, step: float) -> None:
+        """One reading, taken `step` seconds (the update interval it was asked at) after the one before."""
+        self.at.append(self.at[-1] + round(step * 1000) if self.at else 0)
         self.add("cpu", s.cpu)
         self.add("mem", s.vm.percent)
         for g in s.gpus:
@@ -1637,6 +1723,11 @@ class History:
         for n in s.nics:
             self.add(f"nic.{n.name}.recv", n.recv)
             self.add(f"nic.{n.name}.sent", n.sent)
+        while len(self.at) > self.keep_min and self.at[-1] - self.at[0] > self.keep:
+            self.at.popleft()
+        for d in self.data.values():
+            while len(d) > len(self.at):
+                d.popleft()
 
 
 # ---------------------------------------------------------------- widgets
@@ -1659,23 +1750,20 @@ class Graph(Widget):
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
         self.series: list[Series] = []
-        self.step = 1.0
+        self.at: list[int] = []          # when each reading was taken (History.at), in ms
+        self.step = 1.0                  # seconds between readings now
         self.span: float | None = None   # seconds across; None: one reading to a column
-        self.total = 0                   # readings taken so far (the history keeps the last of them)
 
-    def set_series(self, series: list[Series], step: float, span: float | None = None, total: int = 0) -> None:
-        self.series, self.step, self.span, self.total = series, step, span, total
+    def set_series(self, series: list[Series], at: list[int], step: float, span: float | None = None) -> None:
+        self.series, self.at, self.step, self.span = series, at, step, span
         self.refresh()
 
     def render(self) -> Text:
         w, h = self.size.width, self.size.height
         if not self.series or w < 8 or h < 3:
             return Text("")
-        if self.span and self.total:
-            per_col = self.span / self.step / w
-            fit = lambda values: resample(values, w, per_col, self.total)  # noqa: E731
-        else:
-            fit = lambda values: values[-w:]  # noqa: E731
+        col = Fraction(round(self.span * 1000), w) if self.span else Fraction(round(self.step * 1000))  # ms a column
+        fit = lambda values: resample(values, self.at, w, col)  # noqa: E731
         lines: list[Text] = []
         base, extra = divmod(h - 1, len(self.series))   # rows per graph; the first ones get what is left over
         for n, s in enumerate(self.series):
@@ -1703,7 +1791,7 @@ class Graph(Widget):
                 lines.extend(area_rows(vals, w, per - 1, vmax, s.color))
         while len(lines) < h - 1:
             lines.append(Text(""))
-        if self.span and self.total:
+        if self.span:
             span = T["minutes"].format(n=fmt_secs(self.span / 60))
         else:
             span = T["seconds"].format(n=fmt_secs(w * self.step))
@@ -1926,6 +2014,7 @@ class Col:
 
 
 SPANS = (None, 300, 900)   # z steps through these: one reading to a column, 5 minutes, 15 minutes
+SPEEDS = (0.5, 1.0, 2.0, 4.0)   # u steps through these: seconds between readings (Windows: 0.5, 1 and 4)
 PROC_COLS = ("cpu", "mem", "disk", "gpu", "gpumem")
 PROC_W = {"cpu": 8, "mem": 10, "disk": 10, "gpu": 6, "gpumem": 15}
 DET_COLS = ("pid", "status", "user", "cpu", "mem", "threads", "gpumem", "cmd")
@@ -2108,6 +2197,8 @@ class TaskManager(App):
         Binding("v", "gpu_view", T["b_view"]),
         Binding("right", "gpu_page(1)", T["b_cards"], key_display="<- ->" if ARGS.ascii else "← →"),
         Binding("left", "gpu_page(-1)", T["b_cards"], show=False),
+        Binding("u", "speed", T["b_speed"]),                 # in the footer when it fits ...
+        Binding("u", "speed_unlisted", show=False),          # ... and the same key when it does not
         Binding("space", "pause", T["b_pause"], key_display=T["k_space"]),
         Binding("question_mark", "help", T["b_help"], key_display="?"),
         Binding("escape", "escape", show=False),
@@ -2115,17 +2206,23 @@ class TaskManager(App):
         Binding("ctrl+c", "quit", show=False, priority=True),
     ]
 
-    def __init__(self, sampler: Sampler, interval: float) -> None:
+    def __init__(self, sampler: Sampler, interval: float, settings: Path | None = None,
+                 settings_error: str | None = None) -> None:
         super().__init__()
         self.sampler = sampler
-        self.interval = interval
+        self.interval = interval            # seconds between readings; u changes it
+        self.speeds = tuple(sorted({*SPEEDS, interval}))
+        self.settings = settings            # where u keeps the speed for the next start (None: nowhere)
+        self.settings_error = settings_error
+        self.timer = None
+        self.speed_in_bar = False           # whether the top bar has room to say how often it reads
         self.has_gpu = bool(sampler.gpus.handles)
         self.has_gpm = bool(getattr(sampler.gpus, "has_gpm", False))
         cards = len(sampler.gpus.handles)
         self.gpu_per_page = 1 if cards <= 1 else 2 if cards == 2 else 4   # cards on a GPU tab page: 1, 2 or 4
         self.gpu_page = 0
         self.snap: Snapshot | None = None
-        self.history = History(math.ceil(max(s for s in SPANS if s) / interval * 1.1) + 10)  # the longest span
+        self.history = History(keep=max(s for s in SPANS if s) * 1.1)    # the longest span, and some to spare
         self.paused = False
         self._busy = False
         self._last_error: str | None = None
@@ -2172,15 +2269,23 @@ class TaskManager(App):
         self.fit_width()
         if CONFIG_ERROR:
             self.notify(CONFIG_ERROR, severity="warning", timeout=12)
+        if self.settings_error:
+            self.notify(self.settings_error, severity="warning", timeout=12)
         await self.tick(force=True)            # primes every counter: a rate needs two readings
         self.set_timer(0.5, self.tick)         # so the first real numbers come after half a second
-        self.set_interval(self.interval, self.tick)
+        self.start_timer()
+
+    def start_timer(self) -> None:
+        """A reading every `interval` seconds. The timer only starts each reading, as a worker of its own:
+        a timer stopped for a new speed would otherwise cut short the reading it was waiting for."""
+        self.timer = self.set_interval(self.interval, lambda: self.run_worker(self.tick, group="tick"))
 
     def on_unmount(self) -> None:
         self.sampler.gpus.close()
 
     def on_resize(self) -> None:
         self.fit_width()
+        self.refresh_bindings()                # the footer may have room for one more key now, or less
         self.call_after_refresh(self.render_now)
 
     def fit_width(self) -> None:
@@ -2237,7 +2342,19 @@ class TaskManager(App):
             return self.active_tab == "perf"
         if action == "tab" and parameters == ("gpu",):
             return self.has_gpu
+        if action in ("speed", "speed_unlisted"):
+            return self.speed_listed() == (action == "speed")
         return True
+
+    def speed_listed(self) -> bool:
+        """Whether the footer shows "u Update speed": only when it fits beside the tab's other keys, so on
+        a narrow screen those keep their place. u works either way, and ? lists it."""
+        width = 0
+        for b in self.BINDINGS:
+            _, name, params = parse_action(b.action)
+            if b.show and (name == "speed" or self.check_action(name, params)):
+                width += Text(self.get_key_display(b)).cell_len + Text(b.description).cell_len + 3  # as Footer draws it
+        return width <= self.size.width
 
     # ----------------------------------------------------------- reading and drawing
 
@@ -2245,6 +2362,7 @@ class TaskManager(App):
         if (self.paused and not force) or self._busy:
             return
         self._busy = True
+        step = self.interval               # the speed this reading was asked at; a new one counts from the next
         try:
             snap = await asyncio.to_thread(self.sampler.sample)
         except Exception as e:  # one bad reading must not end the program
@@ -2257,7 +2375,7 @@ class TaskManager(App):
             self._busy = False
         self._last_error = None
         self.snap = snap
-        self.history.push(snap)
+        self.history.push(snap, step)
         self.render_now()
 
     def render_now(self) -> None:
@@ -2277,14 +2395,28 @@ class TaskManager(App):
     def render_topbar(self) -> None:
         s = self.snap
         bar = self.query_one("#topbar", Static)
-        left = Text(no_wrap=True)
-        left.append(T["title"], "bold")
-        left.append(f"   CPU {s.cpu:.0f}%   {T['memory']} {fmt_bytes(s.vm.used)} / {fmt_bytes(s.vm.total)}")
-        for g in s.gpus:
-            left.append(f"   GPU{g.index} {pct0(g.util)}")
-        right = (Text(T["paused"], style="bold yellow") if self.paused
-                 else Text(time.strftime("%H:%M:%S", time.localtime(s.t)), style="dim"))
-        bar.update(two_sided(left, right, bar.size.width or max(20, self.size.width - 2)))
+
+        def numbers(cpu: str, used: str, gpus: list[str]) -> Text:
+            t = Text(no_wrap=True)
+            t.append(T["title"], "bold")
+            t.append(f"   CPU {cpu}   {T['memory']} {used} / {fmt_bytes(s.vm.total)}")
+            for g, util in zip(s.gpus, gpus):
+                t.append(f"   GPU{g.index} {util}")
+            return t
+
+        left = numbers(f"{s.cpu:.0f}%", fmt_bytes(s.vm.used), [pct0(g.util) for g in s.gpus])
+        widest = numbers("100%", "1023 MB", ["100%"] * len(s.gpus))     # as wide as those numbers get
+        width = bar.size.width or max(20, self.size.width - 2)
+        clock = Text(time.strftime("%H:%M:%S", time.localtime(s.t)), style="dim")
+        speed = Text(T["speed"].format(n=f"{self.interval:g}") + "   ", style="dim")
+        # how often it reads, before the clock, when it fits beside the numbers at their widest (so it does
+        # not come and go as they change); on a narrow screen the numbers come first
+        self.speed_in_bar = not self.paused and widest.cell_len + 1 + speed.cell_len + clock.cell_len <= width
+        if self.paused:
+            right = Text(T["paused"], style="bold yellow")
+        else:
+            right = Text.assemble(speed, clock) if self.speed_in_bar else clock
+        bar.update(two_sided(left, right, width))
 
     def fill_table(self, table: DataTable, columns: list[Col], rows: list[tuple[str, list]]) -> None:
         """Rebuild a table, keeping the selected row and the scroll position where they were.
@@ -2628,7 +2760,7 @@ class TaskManager(App):
             self.query_one("#pd-cores", CoreGrid).set_data(self.sampler.cpu_groups, self.snap.per_cpu_times,
                                                            self.snap.per_cpu_freq)
         else:
-            graph.set_series(self.perf_series(key), self.interval, self.span, self.history.count)
+            graph.set_series(self.perf_series(key), self.history.times(), self.interval, self.span)
         info = self.query_one("#pd-info", Static)
         info.update(self.perf_info(key, info.size.width or 80))
 
@@ -2727,13 +2859,14 @@ class TaskManager(App):
             return
         first = panels[0][0]
         width = first.query_one(".gp-title", Static).size.width or 40
+        at = self.history.times()
         for panel, g in panels:
             title, name = T["gpu_n"].format(n=g.index), g.name
             if len(title) + 1 + len(name) > width and name.startswith("NVIDIA "):
                 name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
             panel.query_one(".gp-title", Static).update(
                 two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
-            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval, self.span, self.history.count)
+            panel.query_one(Graph).set_series(self.gpu_series(g), at, self.interval, self.span)
         if first.has_class("compact"):
             return                                 # too small for numbers and processes: graphs only
         keys, cols, grid_lines = self.gpu_grid(width)
@@ -2882,13 +3015,33 @@ class TaskManager(App):
         if self.snap:
             self.render_topbar()
 
+    def action_speed(self) -> None:
+        """u: the next update speed. The graphs keep what they have: each reading stays where it was taken."""
+        self.interval = self.speeds[(self.speeds.index(self.interval) + 1) % len(self.speeds)]
+        if self.timer is not None:
+            self.timer.stop()
+        self.start_timer()
+        if self.snap:
+            self.render_now()
+        if not self.speed_in_bar:              # paused, or no room in the top bar: say it here
+            self.notify(T["speed"].format(n=f"{self.interval:g}"), timeout=3)
+        if self.settings is not None:          # the next start begins at this speed
+            problem = save_interval(self.interval, self.settings)
+            if problem:
+                self.notify(problem, severity="warning", timeout=8)
+
+    def action_speed_unlisted(self) -> None:
+        self.action_speed()
+
     def action_help(self) -> None:
         projects = ", ".join(p.name for p in PROJECTS) or (G.dash if CONFIG_ERROR else T["cfg_none"])
         tabs = [T[k] for k in ("tab_proc", "tab_perf", "tab_details", "tab_gpu")[:4 if self.has_gpu else 3]]
+        sep = "／" if ARGS.lang == "zh" else " / "
         self.push_screen(HelpScreen(T["help"].format(
             ncpu=self.sampler.ncpu, config=tilde(CONFIG_FILE), projects=projects,
             tab_keys="  ".join(t.split(" ", 1)[0] for t in tabs),
-            tab_names=("／" if ARGS.lang == "zh" else " / ").join(t.split(" ", 1)[1] for t in tabs))))
+            tab_names=sep.join(t.split(" ", 1)[1] for t in tabs),
+            speeds=sep.join(f"{s:g}" for s in self.speeds), now=f"{self.interval:g}")))
 
     def action_end_task(self) -> None:
         tab = self.active_tab
@@ -2985,7 +3138,9 @@ class TaskManager(App):
 
 
 def main() -> None:
-    TaskManager(Sampler(ARGS.lang), ARGS.interval).run()
+    saved, problem = load_interval() if ARGS.interval is None else (None, None)
+    interval = ARGS.interval or saved or 1.0       # --interval, else the speed last chosen with u, else 1 s
+    TaskManager(Sampler(ARGS.lang), interval, SETTINGS_FILE, problem).run()
 
 
 if __name__ == "__main__":

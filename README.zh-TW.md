@@ -24,14 +24,17 @@ cd taskmgr
 ## 開
 
 ```
-./taskmgr                  每 1 秒更新
-./taskmgr --interval 2     每 2 秒更新
+./taskmgr                  照上次用 u 選的速度更新（一開始是每 1 秒）
+./taskmgr --interval 2     這次每 2 秒更新
 ./taskmgr --lang zh        中文介面（純文字畫面 Ctrl+Alt+F3 沒有中文字型，那裡別用）
 ./taskmgr --ascii          圖只用 ASCII 字元
 ```
 
 在純文字畫面（Ctrl+Alt+F3）圖會自動改成 ASCII。從別台電腦 ssh 進來也能開。
-裡面按 `?` 看所有按鍵；`q` 或 Ctrl+C 離開。
+裡面按 `?` 看所有按鍵；`q` 或 Ctrl+C 離開。按 `u` 換更新速度：每 0.5、1、2、4 秒讀一次，頂端那一列
+會寫現在是幾秒；換了以後，圖上已經有的部分照它當時的時間留著。選的速度記在
+`~/.config/taskmgr/settings.toml`（有設 `XDG_CONFIG_HOME` 的話在它底下），下次開會沿用；有給 `--interval`
+時，那一次以它為準。
 
 ## 四個分頁
 
@@ -109,8 +112,8 @@ dir = "~/code/blog"
 
 ## 成本
 
-它自己讀 `/proc`，不幫每個程式建 psutil 物件。在 64 執行緒的桌機上，讀一次約 30 ms，它自己約用一個
-核心的 4–7%、記憶體約 80 MB。
+它自己讀 `/proc`，不幫每個程式建 psutil 物件。在 64 執行緒的桌機上，讀一次約 30 ms。每秒讀一次時，
+它自己約用一個核心的 4–7%、記憶體約 80 MB；每 0.5 秒讀一次，CPU 大約多一倍。
 
 ## 授權
 
