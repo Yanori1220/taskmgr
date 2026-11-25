@@ -94,6 +94,8 @@ HELP_ZH = """\
   l                效能分頁的 CPU：整體／每個核心的工作狀態（使用率分成程式、系統核心、等待 I/O，
                    加上頻率，和最忙的核心上在跑的程式）
   z                效能和 GPU 分頁：圖涵蓋多長的時間：每格一次讀數／5 分鐘／15 分鐘
+  v                GPU 分頁：一頁放幾張卡：1／2（並排）／4（2×2）
+  ← →              GPU 分頁：換到其他卡（一頁一張時就是上一張、下一張）
   空白鍵           暫停／繼續更新
   q 或 Ctrl+C      離開
   要選取畫面上的字：按住 Shift 再用滑鼠拖
@@ -126,6 +128,8 @@ GPU 分頁（按 4）
   降頻原因      時脈現在為什麼沒到最高：功耗上限、過熱、閒置……
   SM 忙碌、張量核心、記憶體頻寬和 PCIe 要卡支援 NVIDIA 的 GPM 讀數（Hopper 以後的資料中心和
   工作站卡）；不支援的卡就不顯示這幾項。
+  每張卡的程式清單用滑鼠滾輪捲；用鍵盤的話，先點它或按 Tab 移過去，再按 ↑ ↓ PgUp PgDn。
+  一張卡分到的地方太小、放不下數字和程式時，只顯示圖。
 
 Linux 的限制
   每個程式各用多少網路，一般使用者看不到，所以只有效能分頁的總量。
@@ -146,6 +150,8 @@ Keys
                    kernel and I/O wait, its clock, and the programs on the busiest cores)
   z                Performance and GPU tabs: how much time the graphs cover: one reading to a
                    column / 5 minutes / 15 minutes
+  v                GPU tab: cards a page: 1 / 2 (side by side) / 4 (2 x 2)
+  Left Right       GPU tab: the other cards (with one a page, the one before or after)
   Space            pause / resume updates
   q or Ctrl+C      quit
   To select text on screen, hold Shift while dragging
@@ -182,6 +188,9 @@ GPU tab (press 4)
   Slowed by         why the clock is below its top right now: power cap, heat, idle...
   SMs busy, tensor cores, memory bandwidth and PCIe need a card with NVIDIA's GPM readings
   (data-center and workstation cards from Hopper on); other cards leave them out.
+  A card's process list scrolls with the mouse wheel, or with Up Down PgUp PgDn once you click it
+  or move to it with Tab. A card given too little room for its numbers and processes shows its
+  graphs only.
 
 What Linux does not show
   How much network each process uses is hidden from an ordinary user, so only the totals are shown.
@@ -231,7 +240,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "sl_idle": "閒置", "sl_power": "功耗上限", "sl_heat": "過熱", "sl_hw": "硬體降速", "sl_brake": "電源煞車",
         "sl_clocks": "時脈設定", "sl_display": "顯示時脈", "sl_sync": "同步加速", "sl_board": "板卡限制",
         "sl_reliability": "可靠性",
-        "b_zoom": "時間範圍", "minutes": "{n} 分鐘",
+        "b_zoom": "時間範圍", "minutes": "{n} 分鐘", "b_view": "每頁幾張", "b_cards": "切換顯示卡",
         "cores_hint": "l：看每個核心的工作狀態", "cores_back": "l：回到整體",
         "lg_user": "程式", "lg_sys": "系統核心", "lg_iow": "等待 I/O", "lg_cell": "每格：邏輯處理器　使用率　頻率 GHz",
         "lg_pairs": "同一個實體核心的兩個執行緒排在一起：{a} 和 {b}、{c} 和 {d}……",
@@ -294,7 +303,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "sl_idle": "idle", "sl_power": "power cap", "sl_heat": "heat", "sl_hw": "HW slowdown",
         "sl_brake": "power brake", "sl_clocks": "app clocks", "sl_display": "display",
         "sl_sync": "sync boost", "sl_board": "board limit", "sl_reliability": "reliability",
-        "b_zoom": "Time span", "minutes": "{n} minutes",
+        "b_zoom": "Time span", "minutes": "{n} minutes", "b_view": "Cards a page", "b_cards": "Other cards",
         "cores_hint": "l: what each core is doing", "cores_back": "l: back to overall",
         "lg_user": "programs", "lg_sys": "kernel", "lg_iow": "I/O wait", "lg_cell": "each cell: logical processor, use, clock GHz",
         "lg_pairs": "the two threads of one physical core sit together: {a} and {b}, {c} and {d}...",
@@ -1789,60 +1798,80 @@ class PerfItem(ListItem):
         self.key = key
 
 
+class ProcList(VerticalScroll, inherit_bindings=False):
+    """A card's processes, all of them: the mouse wheel scrolls the list, and so do the arrow keys once
+    it is clicked or reached with Tab. Left and right are left to the app: they turn the GPU tab's pages."""
+
+    BINDINGS = [Binding("up", "scroll_up", show=False), Binding("down", "scroll_down", show=False),
+                Binding("pageup", "page_up", show=False), Binding("pagedown", "page_down", show=False),
+                Binding("home", "scroll_home", show=False), Binding("end", "scroll_end", show=False)]
+
+
 class GpuPanel(Vertical):
-    """One card on the GPU tab: its name, graphs of its use and memory, its numbers, the processes on it."""
+    """One card on the GPU tab: its name, graphs of its use and memory, its numbers, the processes on it.
+    Too small for all that ("compact"), it shows its name and graphs only."""
 
     def __init__(self, index: int) -> None:
         super().__init__(id=f"gpu-{index}", classes="gpu-panel")
         self.index = index
+        self.list_rows = 0          # the height last given to its process list
 
     def compose(self) -> ComposeResult:
         yield Static(classes="gp-title")
         yield Graph(classes="gp-graph")
         yield Static(classes="gp-info")
+        yield Static(classes="gp-procs-head")
+        yield ProcList(Static(classes="gp-procs-body"), classes="gp-procs")
 
     def on_resize(self) -> None:
-        """Its text is cut to its size, so a new size needs a redraw (the tab shown, the window resized,
-        the cards placed anew). Every panel is as big as the first, so the first asks for all."""
-        if self.index == 0:
+        """Its text is cut to its size, so a new size needs a redraw (a page shown, the window resized, the
+        cards placed anew). The cards on a page are all as big, so the first one asks for all."""
+        shown = [p for p in self.parent.children if p.display] if self.parent else []
+        if shown and shown[0] is self:
             self.app.call_after_refresh(self.app.render_now)
 
 
-class GpuBox(VerticalScroll):
-    """The GPU tab: the cards side by side, as many across as fit, filling the screen. More cards than
-    fit across wrap into rows. A panel too short to show all it has keeps its height and the tab scrolls."""
+class GpuBox(Grid):
+    """The GPU tab: a page of 1, 2 (side by side) or 4 (2 x 2) cards filling the screen; left and right
+    turn the pages. A card's panel too small for its numbers and processes shows only its graphs."""
 
-    MIN_W = 36                   # one card's panel: narrower shows too little
+    MIN_W = 36                   # a card's panel: narrower, and the cards of a page go under each other
 
     def __init__(self, count: int, min_height: Callable[[int], int], **kw) -> None:
-        super().__init__(Grid(*[GpuPanel(i) for i in range(count)], id="gpu-grid"), **kw)
-        self.min_height = min_height                   # a panel's content width -> the least height it needs
-        self.placed: tuple[int, int, int] | None = None
+        super().__init__(*[GpuPanel(i) for i in range(count)], **kw)
+        self.min_height = min_height       # a panel's content width -> the least height its text needs
+        self.placed: tuple | None = None
 
     def on_resize(self) -> None:
         self.place_cards()
 
     def place_cards(self) -> None:
-        size = self.scrollable_content_region.size     # without the scrollbar, when there is one
-        panels = list(self.query(GpuPanel))
+        size = self.size
+        panels = [w for w in self.children if isinstance(w, GpuPanel)]
         if not panels or size.width < 1 or size.height < 1:
             return                                     # the tab is hidden
-        across = max(1, min(len(panels), size.width // self.MIN_W))
-        rows = math.ceil(len(panels) / across)
-        cols = math.ceil(len(panels) / rows)           # rows as even as can be: four cards 2 x 2, not 3 + 1
+        app = self.app
+        per, page = app.gpu_per_page, app.gpu_page
+        shown = panels[page * per:(page + 1) * per]
+        cols = min(per, 2 if size.width >= 2 * self.MIN_W else 1)
+        rows = math.ceil(per / cols)
         col_w = size.width // cols                     # every column as wide, so the graphs span the same time
-        least = self.min_height(col_w - panels[0].styles.gutter.width)
-        row_h = max(least, (size.height - (rows - 1)) // rows)   # a blank line between rows
-        if (cols, col_w, row_h) == self.placed:
+        row_h = max(1, (size.height - (rows - 1)) // rows)   # a blank line between rows
+        compact = row_h < self.min_height(col_w - panels[0].styles.gutter.width)
+        state = (per, page, cols, col_w, row_h, compact)
+        if state == self.placed:
             return
-        self.placed = (cols, col_w, row_h)
-        grid = self.query_one("#gpu-grid", Grid)
-        grid.styles.grid_size_columns = cols
-        grid.styles.grid_columns = str(col_w)
-        grid.styles.grid_rows = str(row_h)
-        grid.styles.height = rows * row_h + rows - 1
-        for i, p in enumerate(panels):
+        self.placed = state
+        for p in panels:
+            p.display = p in shown
+            p.set_class(compact, "compact")
+        for i, p in enumerate(shown):
             p.set_class(i % cols > 0, "gp-right")      # a line on its left, like the Performance list's
+        self.styles.grid_size_columns = cols
+        self.styles.grid_columns = str(col_w)
+        self.styles.grid_rows = str(row_h)
+        self.can_focus = compact                       # no process list to take the keys: the box takes them
+        app.call_after_refresh(app.keep_gpu_focus)
 
 
 class EndTaskScreen(ModalScreen[str | None]):
@@ -2032,8 +2061,8 @@ class TaskManager(App):
     CSS = """
     Screen { background: $background; }
     #topbar { height: 1; padding: 0 1; background: $panel; }
-    #topbar, #pd-title, #pd-info, .pi-body, Graph, CoreGrid, .gp-title, .gp-info {
-        text-wrap: nowrap; text-overflow: ellipsis; }
+    #topbar, #pd-title, #pd-info, .pi-body, Graph, CoreGrid, .gp-title, .gp-info, .gp-procs-head,
+    .gp-procs-body { text-wrap: nowrap; text-overflow: ellipsis; }
     #search { display: none; margin: 0 1; }
     #tabs { height: 1fr; }
     #tabs TabPane { padding: 0; height: 1fr; }
@@ -2045,13 +2074,17 @@ class TaskManager(App):
     #pd-title { height: 1; margin-bottom: 1; }
     #pd-cores-box { height: 1fr; }
     #pd-info { height: auto; margin-top: 1; }
-    #gpu-box { height: 1fr; }
-    #gpu-grid { grid-gutter: 1 0; }
+    #gpu-box { height: 1fr; grid-gutter: 1 0; }
     .gpu-panel { padding: 0 1 0 2; }
     .gpu-panel.gp-right { border-left: solid $panel; padding: 0 1; }
     .gp-title { height: 1; margin-bottom: 1; }
-    .gp-graph { min-height: 9; }
+    .gp-graph { min-height: 3; }
     .gp-info { height: auto; margin-top: 1; }
+    .gp-procs-head { height: 1; margin-top: 1; }
+    .gp-procs { height: 2; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    .gp-procs:focus { background: $boost; }
+    .compact .gp-title { margin-bottom: 0; }
+    .compact .gp-info, .compact .gp-procs-head, .compact .gp-procs { display: none; }
     EndTaskScreen, HelpScreen { align: center middle; }
     #dialog { width: 80; max-width: 96%; height: auto; border: thick $error; background: $surface; padding: 1 2; }
     #dlg-title { margin-bottom: 1; }
@@ -2072,6 +2105,9 @@ class TaskManager(App):
         Binding("r", "sort_reverse", T["b_reverse"]),
         Binding("l", "cores", T["b_cores"]),
         Binding("z", "zoom", T["b_zoom"]),
+        Binding("v", "gpu_view", T["b_view"]),
+        Binding("right", "gpu_page(1)", T["b_cards"], key_display="<- ->" if ARGS.ascii else "← →"),
+        Binding("left", "gpu_page(-1)", T["b_cards"], show=False),
         Binding("space", "pause", T["b_pause"], key_display=T["k_space"]),
         Binding("question_mark", "help", T["b_help"], key_display="?"),
         Binding("escape", "escape", show=False),
@@ -2085,6 +2121,9 @@ class TaskManager(App):
         self.interval = interval
         self.has_gpu = bool(sampler.gpus.handles)
         self.has_gpm = bool(getattr(sampler.gpus, "has_gpm", False))
+        cards = len(sampler.gpus.handles)
+        self.gpu_per_page = 1 if cards <= 1 else 2 if cards == 2 else 4   # cards on a GPU tab page: 1, 2 or 4
+        self.gpu_page = 0
         self.snap: Snapshot | None = None
         self.history = History(math.ceil(max(s for s in SPANS if s) / interval * 1.1) + 10)  # the longest span
         self.paused = False
@@ -2156,16 +2195,44 @@ class TaskManager(App):
             return "proc"
 
     def focus_tab(self) -> None:
-        target = {"proc": "#proc-table", "perf": "#perf-list", "details": "#details-table",
-                  "gpu": "#gpu-box"}.get(self.active_tab)
+        if self.active_tab == "gpu":
+            self.focus_gpu()
+            return
+        target = {"proc": "#proc-table", "perf": "#perf-list", "details": "#details-table"}.get(self.active_tab)
         if target:
             self.query_one(target).focus()
+
+    def focus_gpu(self) -> None:
+        """The GPU tab's keys go to the first shown card's process list, or, with graphs only, to the box."""
+        box = self.query_one("#gpu-box", GpuBox)
+        lists = [p.query_one(ProcList) for p in box.children
+                 if isinstance(p, GpuPanel) and p.display and not p.has_class("compact")]
+        (lists[0] if lists else box).focus()
+
+    def keep_gpu_focus(self) -> None:
+        """After the cards are placed anew: if the focus went to a hidden list, or out of the tab (the tab
+        bar would turn left and right into changing tabs), bring it back."""
+        if self.active_tab != "gpu":
+            return
+        box, f = self.query_one("#gpu-box", GpuBox), self.focused
+        usable = (isinstance(f, ProcList) and f.parent.display and not f.parent.has_class("compact")
+                  or f is box and box.can_focus)
+        if not usable:
+            self.focus_gpu()
+
+    @property
+    def gpu_pages(self) -> int:
+        return max(1, math.ceil(len(self.sampler.gpus.handles) / self.gpu_per_page))
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action in ("search", "end_task", "sort_next", "sort_reverse"):
             return self.active_tab in ("proc", "details")
         if action == "zoom":
             return self.active_tab in ("perf", "gpu")
+        if action == "gpu_view":
+            return self.active_tab == "gpu" and len(self.sampler.gpus.handles) > 1
+        if action == "gpu_page":
+            return self.active_tab == "gpu" and self.gpu_pages > 1
         if action == "cores":
             return self.active_tab == "perf"
         if action == "tab" and parameters == ("gpu",):
@@ -2567,7 +2634,7 @@ class TaskManager(App):
 
     # ----------------------------------------------------------- the GPU tab
 
-    PROCS_MAX = 8          # processes listed under a card at most
+    PROCS_MAX = 8          # rows a card's process list takes at most; the rest scroll
 
     @property
     def graph_min(self) -> int:
@@ -2611,21 +2678,9 @@ class TaskManager(App):
                           fmt_bytes(g.mem_total), COLORS["gpu"])])
 
     @staticmethod
-    def gpu_shown(g: GpuInfo, lines: int) -> tuple[list[tuple[int, int]], int]:
-        """The processes on a card that fit in `lines` lines, biggest first, and how many are left out
-        (then the last line says so)."""
-        on_card = sorted(g.procs.items(), key=lambda kv: kv[1], reverse=True)
-        if len(on_card) <= lines:
-            return on_card, 0
-        keep = max(0, lines - 1)
-        return on_card[:keep], len(on_card) - keep
-
-    @staticmethod
-    def gpu_procs(shown: list[tuple[int, int]], left_out: int, lines: int, names: dict[int, tuple[str, str]],
-                  widths: tuple[int, int | None, int]) -> list:
-        """A card's processes in exactly `lines` lines, blank ones filling up the rest. `names`: pid -> (its
-        app, its own name). `widths`: of the app, name and PID columns, the same on every card so the
-        columns line up; a name width of None leaves the names out."""
+    def gpu_procs(g: GpuInfo, names: dict[int, tuple[str, str]], widths: tuple[int, int | None, int]) -> Table:
+        """A card's processes, the biggest first. `names`: pid -> (its app, its own name). `widths`: of the
+        app, name and PID columns, the same on every card so the columns line up; None leaves names out."""
         label_w, name_w, pid_w = widths
         table = Table.grid(padding=(0, 2))
         table.add_column(no_wrap=True, width=label_w)
@@ -2633,15 +2688,11 @@ class TaskManager(App):
             table.add_column(no_wrap=True, width=name_w)
         table.add_column(no_wrap=True, justify="right", width=pid_w)
         table.add_column(no_wrap=True, justify="right", width=7)   # fmt_bytes is at most 7 wide
-        for pid, used in shown:
+        for pid, used in sorted(g.procs.items(), key=lambda kv: kv[1], reverse=True):
             label, name = names[pid]
             cells = [Text(label, style="bold")] + ([Text(name, style="dim")] if name_w is not None else [])
             table.add_row(*cells, Text(str(pid), style="dim"), Text(fmt_bytes(used)))
-        out: list = [table] if shown else []
-        if left_out:
-            out.append(Text(T["end_more"].format(n=left_out), style="dim"))
-        used_lines = len(shown) + (1 if left_out else 0)
-        return out + [Text("")] * max(0, lines - used_lines)
+        return table
 
     def gpu_grid(self, width: int) -> tuple[tuple[str, ...], int, int]:
         """(which numbers, columns, lines) of the cards' numbers at this width, one shape for every card.
@@ -2665,44 +2716,57 @@ class TaskManager(App):
         return 2 + self.graph_min + 1 + self.gpu_grid(width)[2] + 2 + 2
 
     def render_gpu(self) -> None:
-        """Every card at once. All the panels are drawn alike, the numbers in the same grid and the process
-        lists padded to the same length, so their graphs are the same height and line up side by side."""
-        self.query_one("#gpu-box", GpuBox).place_cards()   # the least height can change once cards are read
+        """The cards of the page shown. They are drawn alike, the numbers in the same grid and the process
+        lists as tall, so their graphs are the same height and line up side by side."""
+        box = self.query_one("#gpu-box", GpuBox)
+        box.place_cards()                                  # the least height can change once cards are read
         cards = {g.index: g for g in self.snap.gpus}
-        panels = [(p, cards[p.index]) for p in self.query(GpuPanel) if p.index in cards]
+        panels = [(p, cards[p.index]) for p in box.children
+                  if isinstance(p, GpuPanel) and p.display and p.index in cards]
         if not panels:
             return
-        width = panels[0][0].query_one(".gp-title", Static).size.width or 40
-        height = panels[0][0].size.height
+        first = panels[0][0]
+        width = first.query_one(".gp-title", Static).size.width or 40
+        for panel, g in panels:
+            title, name = T["gpu_n"].format(n=g.index), g.name
+            if len(title) + 1 + len(name) > width and name.startswith("NVIDIA "):
+                name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
+            panel.query_one(".gp-title", Static).update(
+                two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
+            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval, self.span, self.history.count)
+        if first.has_class("compact"):
+            return                                 # too small for numbers and processes: graphs only
         keys, cols, grid_lines = self.gpu_grid(width)
-        room = height - 2 - self.graph_min - 1 - grid_lines - 2   # title, graphs, blank, numbers, blank, heading
+        room = first.size.height - 2 - self.graph_min - 1 - grid_lines - 2   # title, graphs, blank, numbers, blank, heading
         most = max(len(g.procs) for _, g in panels)
-        lines = min(most, self.PROCS_MAX, max(1, room))
-        shown = {g.index: self.gpu_shown(g, lines) for _, g in panels}
+        rows = max(1, min(most, self.PROCS_MAX, room))     # the lists' height; a longer list scrolls
+        list_w = first.query_one(ProcList).scrollable_content_region.width or width - 1
         names = {}
-        for rows, _ in shown.values():
-            for pid, _ in rows:
+        for _, g in panels:
+            for pid in g.procs:
                 p, grp = self.snap.procs.get(pid), self.group_of_pid(pid)
                 names[pid] = (grp.label if grp else G.dash, p.name if p else "?")
         label_w = max((Text(a).cell_len for a, _ in names.values()), default=1)
         name_w: int | None = max((Text(b).cell_len for _, b in names.values()), default=1)
         pid_w = max((len(str(pid)) for pid in names), default=1)
         fixed = pid_w + 7 + 2 * 2                  # the PID and memory columns, and the gaps before them
-        if width - fixed - name_w - 2 < min(label_w, 16):
+        if list_w - fixed - name_w - 2 < min(label_w, 16):
             name_w = None                          # the app's name comes first; the process's own if there is room
-        label_w = max(1, min(label_w, width - fixed - (0 if name_w is None else name_w + 2)))
+        label_w = max(1, min(label_w, list_w - fixed - (0 if name_w is None else name_w + 2)))
         for panel, g in panels:
-            title, name = T["gpu_n"].format(n=g.index), g.name
-            if len(title) + 1 + len(name) > width and name.startswith("NVIDIA "):
-                name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
-            head = panel.query_one(".gp-title", Static)
-            head.update(two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
-            panel.query_one(Graph).set_series(self.gpu_series(g), self.interval, self.span, self.history.count)
-            heading = Text(T["i_gpu_procs"] + ("" if g.procs else f"：{T['i_none']}" if ARGS.lang == "zh"
-                                               else f": {T['i_none']}"), style="dim")
-            panel.query_one(".gp-info", Static).update(RichGroup(
-                info_grid(self.gpu_pairs(g, keys), width, tight=True, cols=cols), Text(""), heading,
-                *self.gpu_procs(*shown[g.index], lines, names, (label_w, name_w, pid_w))))
+            panel.query_one(".gp-info", Static).update(
+                info_grid(self.gpu_pairs(g, keys), width, tight=True, cols=cols))
+            n = len(g.procs)
+            if ARGS.lang == "zh":
+                head = T["i_gpu_procs"] + (f"（{n}）" if n else f"：{T['i_none']}")
+            else:
+                head = T["i_gpu_procs"] + (f" ({n})" if n else f": {T['i_none']}")
+            panel.query_one(".gp-procs-head", Static).update(Text(head, style="dim"))
+            plist = panel.query_one(ProcList)
+            if panel.list_rows != rows:
+                panel.list_rows = rows
+                plist.styles.height = rows
+            plist.query_one(Static).update(self.gpu_procs(g, names, (label_w, name_w, pid_w)))
 
     # ----------------------------------------------------------- events
 
@@ -2787,6 +2851,21 @@ class TaskManager(App):
             col, desc = self.sort[tab]
             self.sort[tab] = (col, not desc)
             self.render_now()
+
+    def action_gpu_view(self) -> None:
+        first = self.gpu_page * self.gpu_per_page          # the first card shown stays in view
+        self.gpu_per_page = {1: 2, 2: 4, 4: 1}[self.gpu_per_page]
+        self.gpu_page = first // self.gpu_per_page
+        self.gpu_turned()
+
+    def action_gpu_page(self, step: int) -> None:
+        self.gpu_page = (self.gpu_page + step) % self.gpu_pages
+        self.gpu_turned()
+
+    def gpu_turned(self) -> None:
+        self.refresh_bindings()
+        self.query_one("#gpu-box", GpuBox).place_cards()
+        self.call_after_refresh(self.render_now)
 
     def action_zoom(self) -> None:
         self.span = SPANS[(SPANS.index(self.span) + 1) % len(SPANS)]

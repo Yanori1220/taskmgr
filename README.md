@@ -38,11 +38,11 @@ column names. Enter expands a group, and Del ends a task after asking (SIGTERM, 
 
 **Details**: one row per process, with PID, status, user, threads and command line.
 
-**GPU** (NVIDIA, through NVML): every card at once, side by side. Each one has graphs over the same span
-of time, its temperature, power, fan and clocks, what is holding its clock down (power cap, heat...),
-and the processes on it with how much memory each holds. Cards that do not fit across the window wrap
-into rows, and the tab scrolls when the window is too small for them. The tab is there only when an
-NVIDIA card is.
+**GPU** (NVIDIA, through NVML): the cards side by side, one, two or four to a page (`v`), with `←` `→`
+for the other pages. Each card has graphs over the same span of time, its temperature, power, fan and
+clocks, what is holding its clock down (power cap, heat...), and the processes on it with how much
+memory each holds; that list scrolls with the mouse wheel. A card given too little room shows its graphs
+only. The tab is there only when an NVIDIA card is.
 
 NVIDIA's "utilization" only says whether any work ran at all: one small program running all the time
 shows 100%. Cards with NVIDIA's GPM readings (data-center and workstation cards from Hopper on) also
@@ -92,6 +92,9 @@ taskmgr --ascii          graphs in plain ASCII (automatic on the Linux console)
 | Del or `k` | end task (asks first) |
 | `l` | on the CPU page: overall / each core |
 | `z` | Performance and GPU tabs: the graphs cover one reading per column, 5 minutes or 15 minutes |
+| `v` | GPU tab: one, two (side by side) or four (2 × 2) cards a page |
+| `←` `→` | GPU tab: the other cards |
+| mouse wheel, Tab | GPU tab: scroll a card's process list; Tab moves to the next card's list, whose arrow keys then scroll it |
 | Space | pause / resume |
 | `?` | help |
 | `q` or Ctrl+C | quit |
