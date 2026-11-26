@@ -21,16 +21,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import concurrent.futures
 import json
 import math
 import os
 import pwd
+import queue
 import re
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
@@ -152,6 +156,12 @@ Linux 的限制
   別的使用者（root、postgres…）的程式看得到 CPU 和記憶體，看不到磁碟讀寫，
   要結束它得用 sudo。詳細資料分頁不列核心執行緒，它們都在「Linux 核心」那一組。
 
+出問題時，最上面那一列會說
+  N 秒沒有新的讀數  一次讀取還沒回來。如果卡在某個程式的檔案上 30 秒，之後就跳過那個程式
+                    （不顯示它的記憶體和磁碟用量），其他照常更新
+  顯示卡沒有回應    NVIDIA 驅動程式沒有回應；其他照常更新
+  其他錯誤會顯示一次，並記錄在 {log}
+
 Esc 關閉"""
 
 HELP_EN = """\
@@ -215,6 +225,12 @@ What Linux does not show
   Other users' processes (root, postgres...) show CPU and memory but not disk I/O, and ending
   them needs sudo. The Details tab leaves kernel threads out: they are all in the "Linux kernel" group.
 
+When something goes wrong, the top bar says so
+  No new reading for N s  a reading has not come back; if it waits 30 s on one process's files,
+                          that process is skipped from then on (no memory or disk use shown)
+  GPUs not answering      the NVIDIA driver does not answer; everything else keeps updating
+  Other failures are shown once and written down in {log}
+
 Esc closes"""
 
 STRINGS: dict[str, dict[str, str]] = {
@@ -273,7 +289,9 @@ STRINGS: dict[str, dict[str, str]] = {
         "sent": "已送出 {sig} 給 {n} 個程式", "denied": "{n} 個沒有權限：{users} 的程式要用 sudo 結束",
         "gone": "{n} 個已經不在了", "no_kernel": "Linux 核心的執行緒不能結束", "no_init": "PID 1 不能結束",
         "no_self": "這是工作管理員自己，要離開按 q", "nothing": "這一列沒有可以結束的程式",
-        "sample_error": "讀取失敗：{err}", "help": HELP_ZH,
+        "sample_error": "讀取失敗：{err}", "draw_error": "畫面更新失敗：{err}", "log_note": "詳細記錄在 {log}",
+        "stale": "{n} 秒沒有新的讀數", "gpus_late": "顯示卡 {n} 秒沒有回應",
+        "skipped": "程式 {pid}（{name}）的資料 {n} 秒讀不出來：之後顯示它時不含記憶體和磁碟用量", "help": HELP_ZH,
         "cfg_error": "讀不了 {path}：{err}　專案分組先關掉", "cfg_none": "還沒設定",
         "cfg_python": "要 Python 3.11 以上才讀得了",
         "set_error": "讀不了 {path}：{err}　先用每 1 秒更新", "save_error": "存不了更新速度到 {path}：{err}",
@@ -338,7 +356,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "sent": "Sent {sig} to {n} process(es)", "denied": "{n} not allowed: {users}'s processes need sudo",
         "gone": "{n} already gone", "no_kernel": "Kernel threads cannot be ended", "no_init": "PID 1 cannot be ended",
         "no_self": "That is this Task Manager: press q to quit", "nothing": "Nothing on this row can be ended",
-        "sample_error": "Reading failed: {err}", "help": HELP_EN,
+        "sample_error": "Reading failed: {err}", "draw_error": "Drawing failed: {err}", "log_note": "Details are in {log}",
+        "stale": "No new reading for {n} s", "gpus_late": "GPUs not answering for {n} s",
+        "skipped": "Process {pid} ({name}) kept a reading waiting {n} s: from now on it is shown without its "
+                   "memory and disk use", "help": HELP_EN,
         "cfg_error": "Could not read {path}: {err}. Project groups are off.", "cfg_none": "none set",
         "cfg_python": "it needs Python 3.11 or newer",
         "set_error": "Could not read {path}: {err}. Updating every 1 s for now.",
@@ -375,6 +396,8 @@ G = Glyphs(ARGS.ascii)
 HOME = Path.home()
 CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "taskmgr" / "groups.toml"
 SETTINGS_FILE = CONFIG_FILE.with_name("settings.toml")   # what the app keeps for its next start: the update speed
+# what went wrong, if anything ever does: the program goes on, and the traceback is kept here
+ERROR_LOG = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "taskmgr" / "errors.log"
 MB, GB = 1 << 20, 1 << 30
 
 COLORS = {"cpu": "#4aa3df", "mem": "#b46ee6", "disk": "#6ab04c", "disk2": "#e5c07b",
@@ -766,10 +789,12 @@ class Snapshot:
     groups: list[ProcGroup]
     nprocs: int
     nthreads: int
-    per_cpu_times: list = field(default_factory=list)     # psutil cpu_times_percent, one per logical CPU
+    per_cpu_times: list = field(default_factory=list)     # psutil cpu_times_percent by CPU number; None: offline
     per_cpu_freq: list[float] = field(default_factory=list)  # MHz, one per logical CPU
     cpu_temp: float | None = None
     core_top: dict[int, tuple[float, int, str]] = field(default_factory=dict)  # CPU -> (% of it, pid, thread)
+    gpus_age: float = 0.0          # seconds since `gpus` was read: more than a moment when the cards hang
+    failed: list[tuple[str, BaseException]] = field(default_factory=list)   # parts of the reading that failed
 
 
 # ---------------------------------------------------------------- grouping processes into apps
@@ -1130,6 +1155,15 @@ def read_text(path: str) -> str | None:
         return None
 
 
+def read_int(path: str | None) -> int | None:
+    """A whole number from a /sys file; None when there is no such file, or it holds something else."""
+    text = read_text(path) if path else None
+    try:
+        return int(text) if text else None
+    except ValueError:
+        return None
+
+
 def cpu_model() -> str:
     try:
         with open("/proc/cpuinfo") as f:
@@ -1192,6 +1226,16 @@ def udisks_health(name: str) -> dict | None:
     return health
 
 
+def find_mounts() -> dict[str, list[str]]:
+    """Disk -> where its partitions, and the volumes on them, are mounted."""
+    mounts: dict[str, list[str]] = {}
+    for part in psutil.disk_partitions(all=False):
+        d = parent_disk(os.path.basename(part.device))
+        if d:
+            mounts.setdefault(d, []).append(part.mountpoint)
+    return mounts
+
+
 def parent_disk(name: str, depth: int = 0) -> str | None:
     """'nvme0n1p2' -> 'nvme0n1'; a device-mapper volume -> the disk under it."""
     real = os.path.realpath(f"/sys/class/block/{name}")
@@ -1206,6 +1250,16 @@ def parent_disk(name: str, depth: int = 0) -> str | None:
             if found:
                 return found
     return name
+
+
+def cpu_list(text: str | None) -> list[int]:
+    """A CPU list as /sys writes it, '0-3,8,10-11', as numbers: [0, 1, 2, 3, 8, 10, 11]."""
+    out: list[int] = []
+    for part in (text or "").split(","):
+        lo, _, hi = part.strip().partition("-")
+        if lo.isdigit():
+            out.extend(range(int(lo), int(hi) + 1) if hi.isdigit() else [int(lo)])
+    return out
 
 
 def cpu_layout(n: int, amd: bool, base: str = "/sys/devices/system/cpu") -> list[tuple[str, list[int]]]:
@@ -1247,6 +1301,47 @@ def find_nics() -> list[str]:
 
 def _s(v: object) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
+
+
+GPU_WAIT = 0.5       # seconds a reading waits for the cards; then it goes on with their last numbers
+FAN_EVERY = 5.0      # seconds between readings of a card's fan: slow to read (up to 7 ms a card), slow to change
+HEALTH_WAIT = 1.0    # seconds a drive's first health reading is waited for; later ones arrive when they arrive
+
+
+class Abandoned(Exception):
+    """A reading that was given up while it was stuck (see Sampler.give_up), stopping when it comes back."""
+
+
+class Lane:
+    """A thread of its own that runs one call at a time, handed to it with submit().
+
+    It is a daemon thread, so it never keeps the program from quitting: if a call never comes back (a
+    driver hung by a GPU fault, the /proc file of a process stuck in the kernel), q still quits at once,
+    where the threads asyncio lends out are waited for at exit, five minutes and then for ever."""
+
+    def __init__(self, name: str) -> None:
+        self.jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self.thread = threading.Thread(target=self.serve, name=name, daemon=True)
+        self.thread.start()
+
+    def serve(self) -> None:
+        while (job := self.jobs.get()) is not None:
+            fn, fut = job
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn())
+            except BaseException as e:   # handed to whoever waits for the result
+                fut.set_exception(e)
+
+    def submit(self, fn: Callable[[], object]) -> concurrent.futures.Future:
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self.jobs.put((fn, fut))
+        return fut
+
+    def close(self) -> None:
+        """The thread ends once it has run what it was given."""
+        self.jobs.put(None)
 
 
 class Gpm:
@@ -1317,6 +1412,8 @@ class Gpus:
         except Exception:
             self.handles, self.names = [], []
         self.last_ts = [0] * len(self.handles)
+        self.fan: list[int | None] = [None] * len(self.handles)   # each card's fan, read every FAN_EVERY s
+        self.fan_at = [float("-inf")] * len(self.handles)
         self.mem_v2 = hasattr(nv, "nvmlMemory_v2")
         self.gpm = [gpm_for(h) for h in self.handles]
         self.slowed_fn = (getattr(nv, "nvmlDeviceGetCurrentClocksEventReasons", None)       # its newer name
@@ -1373,6 +1470,8 @@ class Gpus:
                     procs[pr.pid] = max(procs.get(pr.pid, 0), used)  # a process can be in both lists
             for pid, used in procs.items():
                 mem_by_pid.setdefault(pid, {})[i] = used
+            if self.last_ts[i] > time.time() * 1e6 + 1e6:   # NVML stamps samples with the wall clock, and
+                self.last_ts[i] = 0                         # it went back: ask for all it has, not the future
             samples = c(nv.nvmlDeviceGetProcessUtilization, h, self.last_ts[i])
             if samples:
                 acc: dict[int, list[float]] = {}
@@ -1382,6 +1481,8 @@ class Gpus:
                 for pid, us in acc.items():
                     util_by_pid.setdefault(pid, {})[i] = sum(us) / len(us)
             sm, tensor, bw, tx, rx = self.gpm[i].read() if self.gpm[i] else (None,) * 5
+            if time.monotonic() - self.fan_at[i] >= FAN_EVERY:
+                self.fan[i], self.fan_at[i] = c(nv.nvmlDeviceGetFanSpeed, h), time.monotonic()
             infos.append(GpuInfo(
                 index=i, name=self.names[i] if i < len(self.names) else f"GPU {i}",
                 util=float(util.gpu) if util else None,
@@ -1389,7 +1490,7 @@ class Gpus:
                 temp=c(nv.nvmlDeviceGetTemperature, h, nv.NVML_TEMPERATURE_GPU),
                 power=power / 1000 if power is not None else None,
                 power_limit=limit / 1000 if limit is not None else None,
-                fan=c(nv.nvmlDeviceGetFanSpeed, h),
+                fan=self.fan[i],
                 clock_sm=c(nv.nvmlDeviceGetClockInfo, h, nv.NVML_CLOCK_SM),
                 clock_mem=c(nv.nvmlDeviceGetClockInfo, h, nv.NVML_CLOCK_MEM),
                 procs=procs, sm=sm, tensor=tensor, mem_bw=bw,
@@ -1399,7 +1500,12 @@ class Gpus:
 
 
 class Sampler:
-    """Takes one reading of the whole machine. Runs off the UI thread, one reading at a time."""
+    """Takes one reading of the whole machine. Runs off the UI thread, one reading at a time. The cards are
+    read meanwhile in a thread of their own, and the drives' health in another, so neither a GPU that stops
+    answering nor a slow udisks holds up the rest of a reading."""
+
+    gpu_lane: Lane | None = None       # None: no cards (or a made-up sampler, in tests)
+    health_lane: Lane | None = None    # None: no NVMe drive
 
     def __init__(self, lang: str) -> None:
         self.ncpu = psutil.cpu_count() or 1
@@ -1413,20 +1519,33 @@ class Sampler:
         self.cwd_cache: dict[tuple[int, float], str | None] = {}
         self.rule_cache: dict[tuple[int, float], tuple[str, str, str] | None] = {}
         self.disks = find_disks()
-        self.prev_disk: dict[str, object] = {}
-        self.health: dict[str, tuple[float, dict | None]] = {}
+        self.prev_disk: dict[str, tuple] = {}                     # disk -> (its counters, when read)
+        self.health: dict[str, tuple[float, dict | None]] = {}       # drive -> (when read, its SMART data)
+        self.health_jobs: dict[str, concurrent.futures.Future] = {}  # drive -> its health reading under way
+        if any(d.nvme for d in self.disks):
+            self.health_lane = Lane("taskmgr-udisks")
         self.mounts: dict[str, list[str]] = {}
-        self.mounts_at = 0.0
+        self.mounts_at = float("-inf")
         self.nics = find_nics()
-        self.prev_nic: dict[str, object] = {}
+        self.prev_nic: dict[str, tuple] = {}                      # adapter -> (its counters, when read)
         self.gpus = Gpus()
+        if self.gpus.handles:
+            self.gpu_lane = Lane("taskmgr-gpus")
+        self.gpu_job: concurrent.futures.Future | None = None   # the cards' reading under way, or the last one
+        self.gpu_asked = time.monotonic()                        # when that one was asked for
+        self.gpu_last: tuple[list[GpuInfo], dict, dict] = ([], {}, {})   # the cards' last numbers that came back
+        self.gpu_last_asked = self.gpu_asked                     # when those were asked for
         self.boot = psutil.boot_time()
         self.cpu_groups = cpu_layout(self.ncpu, "AMD" in self.cpu_model)
         self.temp_path = find_cpu_temp()
         self.freq_paths = [f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq" for i in range(self.ncpu)]
+        self.freq_max: float | None = None                       # the top clock, MHz: read once a minute
+        self.freq_max_at = float("-inf")
         self.prev_threads: dict[tuple[int, int], float] = {}
-        psutil.cpu_percent(None)
-        psutil.cpu_times_percent(None, percpu=True)
+        self.failed: list[tuple[str, BaseException]] = []        # the parts of this reading that failed
+        self.inside: tuple[int, tuple[int, float]] | None = None  # (generation, process) whose files are being read
+        self.skip: dict[tuple[int, float], list[str]] = {}       # processes not opened any more -> command line
+        self.generation = 0                                      # goes up each time a stuck reading is given up
 
     def user(self, uid: int) -> str:
         if uid not in self.users:
@@ -1437,32 +1556,106 @@ class Sampler:
         return self.users[uid]
 
     def sample(self) -> Snapshot:
-        now = time.monotonic()
-        dt = now - self.prev_t if self.prev_t else None
-        self.prev_t = now
+        self.failed = []
+        fresh = self.ask_gpus()                # the cards are read meanwhile, in their own thread
         cpu = psutil.cpu_percent(None)
-        try:
-            freq = psutil.cpu_freq()
-        except Exception:
-            freq = None
-        per_times = psutil.cpu_times_percent(None, percpu=True)
-        per_freq = [float(read_text(path) or 0) / 1000 for path in self.freq_paths]
-        temp = read_text(self.temp_path) if self.temp_path else None
-        gpus, gmem, gutil = self.gpus.sample()
-        procs = self.sample_procs(dt, gmem, gutil)
+        per_times = self.by_number(psutil.cpu_times_percent(None, percpu=True))
+        per_freq = [(read_int(path) or 0) / 1000 for path in self.freq_paths]
+        freq, freq_max = self.clock(per_freq)
+        temp = read_int(self.temp_path)
+        procs, dt = self.sample_procs()
+        core_top = self.part("busiest threads", lambda: self.thread_usage(procs, dt), {})
+        disks, nics = self.sample_disks(), self.sample_nics()
+        # the cards last: waiting for them delays nothing above (each rate is timed where it is read)
+        gpus, gmem, gutil, gpus_age = self.gpu_result(fresh)
+        for pid in gmem.keys() | gutil.keys():
+            p = procs.get(pid)
+            if p is not None:
+                p.gpu_mem, p.gpu_util = gmem.get(pid, {}), min(100.0, sum(gutil.get(pid, {}).values()))
         user_procs = [p for p in procs.values() if not p.kernel]
         return Snapshot(
-            per_cpu_times=per_times, per_cpu_freq=per_freq, cpu_temp=int(temp) / 1000 if temp else None,
-            core_top=self.thread_usage(procs, dt),
-            t=time.time(), cpu=cpu,
-            freq=freq.current if freq else None, freq_max=freq.max if freq and freq.max else None,
+            per_cpu_times=per_times, per_cpu_freq=per_freq, cpu_temp=None if temp is None else temp / 1000,
+            core_top=core_top, t=time.time(), cpu=cpu, freq=freq, freq_max=freq_max,
             load=os.getloadavg(), uptime=time.time() - self.boot,
             vm=psutil.virtual_memory(), swap=psutil.swap_memory(),
-            gpus=gpus, disks=self.sample_disks(dt), nics=self.sample_nics(dt),
-            procs=procs, groups=self.group(procs),
-            nprocs=len(user_procs), nthreads=sum(p.threads for p in user_procs))
+            gpus=gpus, disks=disks, nics=nics, procs=procs, groups=self.group(procs),
+            nprocs=len(user_procs), nthreads=sum(p.threads for p in user_procs),
+            gpus_age=gpus_age, failed=self.failed)
 
-    def sample_procs(self, dt: float | None, gmem: dict, gutil: dict) -> dict[int, Proc]:
+    def by_number(self, times: list) -> list:
+        """psutil's per-CPU list holds only the CPUs online, without their numbers. With one switched off
+        since the start, each entry goes back to its own number, and an offline CPU gets None."""
+        if len(times) >= self.ncpu:
+            return times
+        online = cpu_list(read_text("/sys/devices/system/cpu/online"))
+        if len(online) != len(times):          # changing right now: right again at the next reading
+            return times
+        out: list = [None] * self.ncpu
+        for cpu, t in zip(online, times):
+            if cpu < self.ncpu:
+                out[cpu] = t
+        return out
+
+    def part(self, name: str, read: Callable[[], object], fallback: object) -> object:
+        """One part of a reading that the rest can do without: if it fails, the reading still counts, with
+        `fallback` for that part, and the failure goes to the error log."""
+        try:
+            return read()
+        except Exception as e:
+            self.failed.append((name, e))
+            return fallback
+
+    def clock(self, per_freq: list[float]) -> tuple[float | None, float | None]:
+        """(mean, top) clock of the logical processors, in MHz, from the files the each-core view reads
+        anyway. Without those files (some virtual machines), psutil's, which reads all of /proc/cpuinfo."""
+        on = [f for f in per_freq if f > 0]
+        if not on:
+            try:
+                f = psutil.cpu_freq()
+            except Exception:
+                return None, None
+            return (f.current if f else None), (f.max if f and f.max else None)
+        if time.monotonic() - self.freq_max_at > 60:   # it changes with a power profile at most
+            tops = [t for t in (read_int(p.replace("_cur_", "_max_")) for p in self.freq_paths) if t]
+            self.freq_max = sum(tops) / len(tops) / 1000 if tops else None
+            self.freq_max_at = time.monotonic()
+        return sum(on) / len(on), self.freq_max
+
+    def ask_gpus(self) -> bool:
+        """Starts reading the cards, unless their last reading has not come back yet. True if it started."""
+        if self.gpu_lane is None or (self.gpu_job is not None and not self.gpu_job.done()):
+            return False
+        self.gpu_job, self.gpu_asked = self.gpu_lane.submit(self.gpus.sample), time.monotonic()
+        return True
+
+    def gpu_result(self, fresh: bool) -> tuple[list[GpuInfo], dict, dict, float]:
+        """The cards' numbers, and how old they are in seconds. Those of the reading started with this one,
+        waited for up to GPU_WAIT s; if it has not come back, the last numbers that did, getting older."""
+        job = self.gpu_job
+        if job is None:
+            return [], {}, {}, 0.0
+        try:
+            self.gpu_last = job.result(timeout=GPU_WAIT if fresh else 0)
+            self.gpu_last_asked = self.gpu_asked
+        except TimeoutError:
+            pass
+        except Exception as e:                 # each NVML call has its own guard: this would be a bug
+            self.failed.append(("GPUs", e))
+        return (*self.gpu_last, time.monotonic() - self.gpu_last_asked)
+
+    def close(self) -> None:
+        """At quit: NVML shut down (unless a reading is stuck inside it), the threads told to end."""
+        self.gpus.close()
+        for lane in (self.gpu_lane, self.health_lane):
+            if lane is not None:
+                lane.close()
+
+    def sample_procs(self) -> tuple[dict[int, Proc], float | None]:
+        """Every process, from /proc, and the seconds since they were last read (None the first time).
+        A process skipped since its files kept a reading waiting (see give_up) shows only what its stat
+        line holds, which never waits, and the command line it had then."""
+        gen, now = self.generation, time.monotonic()
+        dt = now - self.prev_t if self.prev_t else None
         procs: dict[int, Proc] = {}
         prev, cwds = {}, {}
         for entry in os.listdir("/proc"):
@@ -1471,14 +1664,22 @@ class Sampler:
             pid = int(entry)
             try:
                 comm, status, ppid, cpu_s, threads, ct = read_stat(pid)
-                kernel = pid == 2 or ppid == 2
+                key, kernel = (pid, ct), pid == 2 or ppid == 2
+                skip = key in self.skip
                 # kernel threads (on a machine with many cores, most of the processes) have nothing more to read
-                uid = 0 if kernel else read_uid(pid)
-                cmd = [] if kernel else read_cmdline(pid)
+                if kernel:
+                    uid, cmd = 0, []
+                elif skip:
+                    uid, cmd = os.stat(f"/proc/{pid}").st_uid, self.skip[key]
+                else:
+                    self.inside = (gen, key)       # if a read below never comes back, this is the one
+                    uid, cmd = read_uid(pid), read_cmdline(pid)
             except (OSError, ValueError, IndexError):
                 continue  # gone between the listing and the reading
-            key = (pid, ct)
-            io_b = None if kernel else read_io(pid)
+            io_b = None if kernel or skip else read_io(pid)
+            mem = None if kernel or skip else read_mem(pid)
+            if self.generation != gen:
+                raise Abandoned                    # given up while stuck above: a new reading has taken over
             last = self.prev_proc.get(key)
             cpu, disk = 0.0, (None if io_b is None else 0.0)
             if last and dt:
@@ -1493,8 +1694,8 @@ class Sampler:
                     name = base
             cwd = None
             if name.startswith("python") or name == "pytest" or (cmd and os.path.basename(cmd[0]).startswith("python")):
-                if key in self.cwd_cache:
-                    cwd = self.cwd_cache[key]
+                if key in self.cwd_cache or skip:
+                    cwd = self.cwd_cache.get(key)
                 else:
                     try:
                         cwd = os.readlink(f"/proc/{pid}/cwd")
@@ -1503,10 +1704,38 @@ class Sampler:
                 cwds[key] = cwd
             procs[pid] = Proc(
                 pid=pid, ppid=ppid, ct=ct, name=name, uid=uid, user=self.user(uid), status=status,
-                threads=threads, cmdline=cmd, cpu=cpu, mem=None if kernel else read_mem(pid), disk=disk,
-                gpu_mem=gmem.get(pid, {}), gpu_util=min(100.0, sum(gutil.get(pid, {}).values())), cwd=cwd)
-        self.prev_proc, self.cwd_cache = prev, cwds
-        return procs
+                threads=threads, cmdline=cmd, cpu=cpu, mem=mem, disk=disk, cwd=cwd)
+        if self.generation != gen:
+            raise Abandoned
+        self.inside = None
+        self.prev_t, self.prev_proc, self.cwd_cache = now, prev, cwds
+        if self.skip:
+            self.skip = {k: v for k, v in self.skip.items() if k in prev}   # forgotten once they have ended
+        return procs, dt
+
+    def give_up(self, procs: dict[int, Proc]) -> tuple[int, str] | None:
+        """Gives up the reading under way, if it is stuck reading the files of one process: a process stuck
+        in the kernel (after a GPU fault, say) can hold its /proc/<pid>/cmdline for ever. That process is
+        not opened again, only its stat line read; `procs` (the last reading's) gives its command line.
+        The stuck reading, if it ever comes back, stops at once. Returns (pid, name), or None when the
+        reading is stuck somewhere else, where skipping a process would not help."""
+        inside = self.inside
+        if inside is None or inside[0] != self.generation:
+            return None
+        pid, ct = key = inside[1]
+        p = procs.get(pid)
+        known = p if p is not None and p.ct == ct else None
+        self.skip[key] = known.cmdline if known else []
+        self.generation += 1
+        self.inside = None
+        return pid, known.name if known else "?"
+
+    def busy(self) -> bool:
+        """Whether the cards' or a drive's reading is still under way (at quit: maybe stuck for good)."""
+        if self.gpu_lane is None and self.health_lane is None:
+            return False
+        return (self.gpu_job is not None and not self.gpu_job.done()
+                or any(not job.done() for job in self.health_jobs.values()))
 
     def thread_usage(self, procs: dict[int, Proc], dt: float | None) -> dict[int, tuple[float, int, str]]:
         """Logical CPU -> (% of that CPU, pid, thread name) of the busiest thread that last ran on it.
@@ -1514,8 +1743,9 @@ class Sampler:
         Only the busiest processes are opened thread by thread (the machine has thousands of threads,
         and reading them all every second would cost more than everything else together). A thread
         that moved between CPUs during the second counts on the one it was on last."""
-        # programs over 3% of one CPU (p.cpu is a share of the whole machine)
-        busy = sorted((p for p in procs.values() if p.cpu * self.ncpu >= 3), key=lambda p: p.cpu, reverse=True)[:12]
+        # programs over 3% of one CPU (p.cpu is a share of the whole machine), not skipped (see give_up)
+        busy = sorted((p for p in procs.values() if p.cpu * self.ncpu >= 3 and (p.pid, p.ct) not in self.skip),
+                      key=lambda p: p.cpu, reverse=True)[:12]
         prev: dict[tuple[int, int], float] = {}
         top: dict[int, tuple[float, int, str]] = {}
         for p in busy:
@@ -1614,29 +1844,31 @@ class Sampler:
         self.rule_cache = {k: v for k, v in self.rule_cache.items() if k in alive}
         return list(groups.values())
 
-    def sample_disks(self, dt: float | None) -> list[DiskInfo]:
+    def sample_disks(self) -> list[DiskInfo]:
+        """Each disk's rates since its counters were last read, each timed where it is read. psutil's
+        wrap correction is not used: it keeps something for every disk name it has ever seen, and the
+        kernel's 32-bit fields (milliseconds) take years of busy time to wrap; when one does, that one
+        reading leaves the rate out."""
         if time.monotonic() - self.mounts_at > 30:
-            mounts: dict[str, list[str]] = {}
-            for part in psutil.disk_partitions(all=False):
-                d = parent_disk(os.path.basename(part.device))
-                if d:
-                    mounts.setdefault(d, []).append(part.mountpoint)
-            self.mounts, self.mounts_at = mounts, time.monotonic()
-        counters = psutil.disk_io_counters(perdisk=True, nowrap=True) or {}
+            self.mounts = self.part("mount points", find_mounts, self.mounts)
+            self.mounts_at = time.monotonic()
+        counters = self.part("disk counters", lambda: psutil.disk_io_counters(perdisk=True, nowrap=False) or {}, {})
+        now = time.monotonic()
         out = []
         for d in self.disks:
-            c, p = counters.get(d.name), self.prev_disk.get(d.name)
+            c, last = counters.get(d.name), self.prev_disk.get(d.name)
             read = write = active = 0.0
             resp = None
-            if c and p and dt:
+            if c and last and now > last[1]:
+                p, dt = last[0], now - last[1]
                 read = max(0, c.read_bytes - p.read_bytes) / dt
                 write = max(0, c.write_bytes - p.write_bytes) / dt
                 active = min(100.0, max(0.0, (c.busy_time - p.busy_time) / (dt * 1000) * 100))
                 n_io = (c.read_count + c.write_count) - (p.read_count + p.write_count)
                 t_io = (c.read_time + c.write_time) - (p.read_time + p.write_time)
-                resp = t_io / n_io if n_io > 0 else 0.0
+                resp = (t_io / n_io if t_io >= 0 else None) if n_io > 0 else 0.0
             if c:
-                self.prev_disk[d.name] = c
+                self.prev_disk[d.name] = (c, now)
             raw = read_text(d.temp_path) if d.temp_path else None
             space = []
             for mount in sorted(self.mounts.get(d.name, [])):
@@ -1647,32 +1879,51 @@ class Sampler:
                 space.append((mount, u.used, u.total, u.percent))
             out.append(DiskInfo(d, read, write, active, resp, self.mounts.get(d.name, []),
                                 temp=int(raw) / 1000 if raw and raw.lstrip("-").isdigit() else None,
-                                space=space, health=self.disk_health(d)))
+                                space=space, health=self.part("disk health", lambda: self.disk_health(d), None)))
         return out
 
     def disk_health(self, d: DiskDev) -> dict | None:
-        """udisks' SMART data, asked for once a minute (udisks itself refreshes it every few minutes);
-        after a failure, again in five."""
-        if not d.nvme:
+        """udisks' SMART data, asked for once a minute (udisks itself refreshes it every few minutes), and
+        after a failure again in five. It is read in a thread of its own, so a slow udisks never holds up a
+        reading; only a drive's very first health reading is waited for, up to HEALTH_WAIT s."""
+        if not d.nvme or self.health_lane is None:
             return None
-        at, health = self.health.get(d.name, (float("-inf"), None))
-        if time.monotonic() - at > (60 if health else 300):
-            health = udisks_health(d.name)
-            self.health[d.name] = (time.monotonic(), health)
+        job, wait = self.health_jobs.get(d.name), 0.0
+        if job is None:
+            at, health = self.health.get(d.name, (float("-inf"), None))
+            if time.monotonic() - at <= (60 if health else 300):
+                return health
+            job = self.health_jobs[d.name] = self.health_lane.submit(lambda: udisks_health(d.name))
+            wait = 0.0 if d.name in self.health else HEALTH_WAIT
+        try:
+            health = job.result(timeout=wait)
+        except TimeoutError:
+            return self.health.get(d.name, (0.0, None))[1]
+        except Exception as e:                 # an answer of an unexpected shape: asked again in five minutes
+            self.failed.append(("disk health", e))
+            health = None
+        del self.health_jobs[d.name]
+        self.health[d.name] = (time.monotonic(), health)
         return health
 
-    def sample_nics(self, dt: float | None) -> list[NicInfo]:
-        counters = psutil.net_io_counters(pernic=True, nowrap=True)
-        stats, addrs = psutil.net_if_stats(), psutil.net_if_addrs()
+    def sample_nics(self) -> list[NicInfo]:
+        """Each adapter's rates since its counters were last read, timed where they are read. The kernel's
+        byte counters are 64-bit (no wrap to correct, so psutil's correction, which keeps something for
+        every adapter name it has ever seen, such as each container's, is not used)."""
+        counters = self.part("network counters", lambda: psutil.net_io_counters(pernic=True, nowrap=False), {})
+        now = time.monotonic()
+        stats = self.part("network adapters", psutil.net_if_stats, {})
+        addrs = self.part("network addresses", psutil.net_if_addrs, {})
         out = []
         for n in self.nics:
-            c, p = counters.get(n), self.prev_nic.get(n)
+            c, last = counters.get(n), self.prev_nic.get(n)
             recv = sent = 0.0
-            if c and p and dt:
+            if c and last and now > last[1]:
+                p, dt = last[0], now - last[1]
                 recv = max(0, c.bytes_recv - p.bytes_recv) / dt
                 sent = max(0, c.bytes_sent - p.bytes_sent) / dt
             if c:
-                self.prev_nic[n] = c
+                self.prev_nic[n] = (c, now)
             st = stats.get(n)
             out.append(NicInfo(
                 name=n, wifi=os.path.isdir(f"/sys/class/net/{n}/wireless"), up=bool(st and st.isup),
@@ -1695,34 +1946,32 @@ class History:
         self.at: deque[int] = deque()
         self.data: dict[str, deque] = {}
 
-    def add(self, key: str, value: float | None) -> None:
-        d = self.data.get(key)
-        if d is None:
-            d = self.data[key] = deque()
-        d.append(value)
-
     def get(self, key: str) -> list:
         return list(self.data.get(key, ()))
 
     def times(self) -> list[int]:
         return list(self.at)
 
-    def push(self, s: Snapshot, step: float) -> None:
-        """One reading, taken `step` seconds (the update interval it was asked at) after the one before."""
+    def push(self, s: Snapshot, step: float, gpus_stale: bool = False) -> None:
+        """One reading, taken `step` seconds (the update interval it was asked at) after the one before.
+        `gpus_stale`: the cards have not answered for a while, so their graphs get a gap, not old numbers.
+        Every graph gets a value with every reading (None if it has none this time), so each one stays in
+        step with the times."""
         self.at.append(self.at[-1] + round(step * 1000) if self.at else 0)
-        self.add("cpu", s.cpu)
-        self.add("mem", s.vm.percent)
+        values: dict[str, float | None] = {"cpu": s.cpu, "mem": s.vm.percent}
         for g in s.gpus:
-            self.add(f"gpu{g.index}.util", g.util or 0)
-            self.add(f"gpu{g.index}.mem", g.mem_used or 0)
-            self.add(f"gpu{g.index}.bw", g.mem_bw)          # None: no GPM, or its first reading
+            values[f"gpu{g.index}.util"] = None if gpus_stale else g.util or 0
+            values[f"gpu{g.index}.mem"] = None if gpus_stale else g.mem_used or 0
+            values[f"gpu{g.index}.bw"] = None if gpus_stale else g.mem_bw   # None: no GPM, or its first reading
         for d in s.disks:
-            self.add(f"disk.{d.dev.name}.active", d.active)
-            self.add(f"disk.{d.dev.name}.read", d.read)
-            self.add(f"disk.{d.dev.name}.write", d.write)
+            values[f"disk.{d.dev.name}.active"] = d.active
+            values[f"disk.{d.dev.name}.read"] = d.read
+            values[f"disk.{d.dev.name}.write"] = d.write
         for n in s.nics:
-            self.add(f"nic.{n.name}.recv", n.recv)
-            self.add(f"nic.{n.name}.sent", n.sent)
+            values[f"nic.{n.name}.recv"] = n.recv
+            values[f"nic.{n.name}.sent"] = n.sent
+        for key in self.data.keys() | values.keys():
+            self.data.setdefault(key, deque()).append(values.get(key))
         while len(self.at) > self.keep_min and self.at[-1] - self.at[0] > self.keep:
             self.at.popleft()
         for d in self.data.values():
@@ -1759,6 +2008,13 @@ class Graph(Widget):
         self.refresh()
 
     def render(self) -> Text:
+        try:
+            return self.draw()
+        except Exception as e:             # Textual calls this itself: a failure here would end the program
+            self.app.report(T["draw_error"], e, "graph")
+            return Text("")
+
+    def draw(self) -> Text:
         w, h = self.size.width, self.size.height
         if not self.series or w < 8 or h < 3:
             return Text("")
@@ -1822,11 +2078,15 @@ class CoreGrid(Widget):
         return t.user + t.nice, t.system + t.irq + t.softirq + t.steal, t.iowait
 
     def cell(self, i: int, bar_w: int, cell_w: int) -> Text:
+        t = Text(no_wrap=True)
+        t.append(f"{i:>2} ", "dim")
+        if i >= len(self.times) or self.times[i] is None:   # switched off since the start: nothing to show
+            t.append(G.dash, "dim")
+            t.append(" " * max(0, cell_w - t.cell_len))
+            return t
         user, kern, iow = self.split(self.times[i])
         busy = min(100.0, user + kern)
         ghz = self.freq[i] / 1000 if i < len(self.freq) else 0.0
-        t = Text(no_wrap=True)
-        t.append(f"{i:>2} ", "dim")
         t.append_text(stacked_bar([(user, CORE_COLORS["user"]), (kern, CORE_COLORS["sys"]), (iow, CORE_COLORS["iow"])],
                                   bar_w))
         t.append(f" {busy:>3.0f}%", heat(busy, 10, 40, 80) or "")
@@ -1835,6 +2095,13 @@ class CoreGrid(Widget):
         return t
 
     def render(self) -> Text:
+        try:
+            return self.draw()
+        except Exception as e:             # Textual calls this itself: a failure here would end the program
+            self.app.report(T["draw_error"], e, "each core")
+            return Text("")
+
+    def draw(self) -> Text:
         w = self.size.width
         if not self.times or w < 16:
             return Text("")
@@ -1862,7 +2129,8 @@ class CoreGrid(Widget):
         if any(label for label, _ in cols):
             head = Text(no_wrap=True)
             for k, (label, ids) in enumerate(cols):
-                avg = sum(min(100.0, sum(self.split(self.times[i])[:2])) for i in ids) / max(1, len(ids))
+                on = [self.times[i] for i in ids if i < len(self.times) and self.times[i] is not None]
+                avg = sum(min(100.0, sum(self.split(t)[:2])) for t in on) / max(1, len(on))
                 part = Text.assemble((label, "bold"), (f"  {avg:.0f}%", "dim"))
                 head.append(" " * (self.GAP if k else 0))
                 head.append_text(part)
@@ -1944,7 +2212,7 @@ class GpuBox(Grid):
         self.placed: tuple | None = None
 
     def on_resize(self) -> None:
-        self.place_cards()
+        self.app.safely(self.place_cards)
 
     def place_cards(self) -> None:
         size = self.size
@@ -2028,6 +2296,10 @@ class Col:
 
 SPANS = (None, 300, 900)   # z steps through these: one reading to a column, 5 minutes, 15 minutes
 SPEEDS = (0.5, 1.0, 2.0, 4.0)   # u steps through these: seconds between readings (Windows: 0.5, 1 and 4)
+STALE_AFTER = 10.0   # seconds without a new reading (or three update intervals) before the top bar says so
+GIVE_UP_AFTER = 30.0  # seconds a reading may wait on one process's files before that process is skipped
+GPU_LATE = 5.0       # seconds the cards may keep their numbers waiting (or two intervals) before it says so
+LOG_MAX = 1 << 20    # bytes: past this the error log starts over, the old one kept as errors.log.1
 PROC_COLS = ("cpu", "mem", "disk", "gpu", "gpumem")
 PROC_W = {"cpu": 8, "mem": 10, "disk": 10, "gpu": 6, "gpumem": 15}
 DET_COLS = ("pid", "status", "user", "cpu", "mem", "threads", "gpumem", "cmd")
@@ -2220,9 +2492,17 @@ class TaskManager(App):
     ]
 
     def __init__(self, sampler: Sampler, interval: float, settings: Path | None = None,
-                 settings_error: str | None = None) -> None:
+                 settings_error: str | None = None, error_log: Path | None = None) -> None:
         super().__init__()
         self.sampler = sampler
+        self.reader = Lane("taskmgr-reading")   # readings are taken in this thread, one at a time
+        self.reading_since: float | None = None  # when the reading under way was asked for (None: none is)
+        self.reading: asyncio.Future | None = None   # that reading, as awaited
+        self.gave_up = 0                         # readings given up, stuck in a process's files
+        self.left_behind: list[Lane] = []        # the threads of those readings
+        self.read_at: float | None = None        # when the last reading came back
+        self.error_log = error_log               # where failures are written down (None: nowhere, as in tests)
+        self.errors_seen: dict[tuple[str, str, str], int] = {}   # each kind of failure -> how often so far
         self.interval = interval            # seconds between readings; u changes it
         self.speeds = tuple(sorted({*SPEEDS, interval}))
         self.settings = settings            # where u keeps the speed for the next start (None: nowhere)
@@ -2237,8 +2517,6 @@ class TaskManager(App):
         self.snap: Snapshot | None = None
         self.history = History(keep=max(s for s in SPANS if s) * 1.1)    # the longest span, and some to spare
         self.paused = False
-        self._busy = False
-        self._last_error: str | None = None
         self.query_text = ""
         self.sort = {"proc": ("cpu", True), "details": ("cpu", True)}
         self.expanded: set[str] = set()
@@ -2281,20 +2559,25 @@ class TaskManager(App):
         self.query_one("#proc-table").focus()
         self.fit_width()
         if CONFIG_ERROR:
-            self.notify(CONFIG_ERROR, severity="warning", timeout=12)
+            self.notify(CONFIG_ERROR, severity="warning", timeout=12, markup=False)
         if self.settings_error:
-            self.notify(self.settings_error, severity="warning", timeout=12)
-        await self.tick(force=True)            # primes every counter: a rate needs two readings
-        self.set_timer(0.5, self.tick)         # so the first real numbers come after half a second
+            self.notify(self.settings_error, severity="warning", timeout=12, markup=False)
         self.start_timer()
+        self.read_now(force=True)              # primes every counter: a rate needs two readings ...
+        self.set_timer(0.5, self.read_now)     # ... so the first real numbers come after half a second
 
     def start_timer(self) -> None:
         """A reading every `interval` seconds. The timer only starts each reading, as a worker of its own:
         a timer stopped for a new speed would otherwise cut short the reading it was waiting for."""
-        self.timer = self.set_interval(self.interval, lambda: self.run_worker(self.tick, group="tick"))
+        self.timer = self.set_interval(self.interval, self.read_now)
+
+    def read_now(self, force: bool = False) -> None:
+        """A reading and the redraw after it, as a worker of their own (skipped if a reading is under way)."""
+        self.run_worker(self.tick(force=force), group="tick", exit_on_error=False)
 
     def on_unmount(self) -> None:
-        self.sampler.gpus.close()
+        self.sampler.close()
+        self.reader.close()
 
     def on_resize(self) -> None:
         self.fit_width()
@@ -2372,28 +2655,129 @@ class TaskManager(App):
     # ----------------------------------------------------------- reading and drawing
 
     async def tick(self, force: bool = False) -> None:
-        if (self.paused and not force) or self._busy:
+        """One reading, then the screen redrawn. Never two readings at once: while one has not come back,
+        the next ones are skipped, and if that goes on, the top bar says for how long."""
+        if self.reading_since is not None:
+            if time.monotonic() - self.reading_since > GIVE_UP_AFTER:
+                self.give_up_reading()
+            if self.stale_for():
+                self.safely(self.render_topbar)
             return
-        self._busy = True
+        if self.paused and not force:
+            return
+        self.reading_since = time.monotonic()
         step = self.interval               # the speed this reading was asked at; a new one counts from the next
         try:
-            snap = await asyncio.to_thread(self.sampler.sample)
-        except Exception as e:  # one bad reading must not end the program
-            msg = T["sample_error"].format(err=f"{type(e).__name__}: {e}")
-            if msg != self._last_error:
-                self.notify(msg, severity="error", timeout=8)
-                self._last_error = msg
+            self.reading = asyncio.wrap_future(self.reader.submit(self.sampler.sample))
+            snap = await self.reading
+        except Exception as e:             # one bad reading must not end the program
+            self.report(T["sample_error"], e, "reading")
+            if self.stale_for():
+                self.safely(self.render_topbar)
             return
         finally:
-            self._busy = False
-        self._last_error = None
-        self.snap = snap
-        self.history.push(snap, step)
+            self.reading_since = self.reading = None
+        self.snap, self.read_at = snap, time.monotonic()
+        for part, e in snap.failed:        # a part the reading did without: written down, not shown
+            self.report(None, e, part)
+        try:
+            self.history.push(snap, step, gpus_stale=snap.gpus_age >= self.gpu_late_after())
+        except Exception as e:
+            self.report(T["draw_error"], e, "history")
         self.render_now()
 
-    def render_now(self) -> None:
-        if self.snap is None:
+    def give_up_reading(self) -> None:
+        """The reading under way has waited GIVE_UP_AFTER s on one process's files (a process stuck in the
+        kernel): that process is skipped from now on, and readings go on in a new thread, the stuck one
+        left behind. A few times at most: each leaves a thread behind."""
+        if self.gave_up >= 5:
             return
+        stuck = self.sampler.give_up(self.snap.procs if self.snap else {})
+        if stuck is None:                  # stuck elsewhere: nothing to skip; the top bar says how long
+            return
+        self.gave_up += 1
+        self.left_behind.append(self.reader)
+        self.reader.close()                # its thread ends if the stuck call ever comes back
+        self.reader = Lane("taskmgr-reading")
+        if self.reading is not None:
+            self.reading.cancel()          # the tick waiting for it ends; the next one starts afresh
+        msg = T["skipped"].format(pid=stuck[0], name=stuck[1], n=f"{GIVE_UP_AFTER:.0f}")
+        self.notify(msg, severity="warning", timeout=20, markup=False)
+        self.write_log(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  reading: {msg}\n\n")
+
+    def left_stuck(self) -> bool:
+        """At quit: whether a reading is still stuck in the kernel or in NVIDIA's library."""
+        return (self.reading_since is not None or any(lane.thread.is_alive() for lane in self.left_behind)
+                or self.sampler.busy())
+
+    def stale_for(self) -> float:
+        """Seconds since the last reading came back, when that is far longer than it should be; else 0."""
+        if self.paused or self.read_at is None:
+            return 0.0
+        age = time.monotonic() - self.read_at
+        return age if age > max(STALE_AFTER, 3 * self.interval) else 0.0
+
+    def gpu_late_after(self) -> float:
+        """Seconds the cards may keep their numbers waiting before they count as not answering."""
+        return max(GPU_LATE, 2 * self.interval)
+
+    def report(self, toast: str | None, e: BaseException, where: str) -> None:
+        """Something failed, and the program goes on. The first time a kind of failure happens, `toast` (a
+        text with {err}) is shown for a moment, and the failure goes to the error log with its traceback;
+        after that it is only counted there (on its 10th, 100th, 1000th... time)."""
+        tb = e.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        kind = (where, type(e).__name__, f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}" if tb else "")
+        if len(self.errors_seen) > 200:          # this many kinds: count anew rather than keep them all
+            self.errors_seen.clear()
+        n = self.errors_seen[kind] = self.errors_seen.get(kind, 0) + 1
+        logged = self.log_error(where, e, n)
+        if n == 1 and toast:
+            msg = toast.format(err=f"{type(e).__name__}: {e}")
+            if logged:
+                msg += "\n" + T["log_note"].format(log=tilde(self.error_log))
+            self.notify(msg, severity="error", timeout=12, markup=False)
+
+    def log_error(self, where: str, e: BaseException, n: int) -> bool:
+        """Writes the `n`th failure of a kind to the error log: the first with its traceback, the 10th,
+        100th... as one line. True if written."""
+        times = str(n)
+        if times != "1" + "0" * (len(times) - 1):
+            return False
+        head = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {where}"
+        if n == 1:
+            return self.write_log(head + "\n" + "".join(traceback.format_exception(e)) + "\n")
+        return self.write_log(head + f": {type(e).__name__}: {e}  ({n} times so far)\n\n")
+
+    def write_log(self, text: str) -> bool:
+        """Adds `text` to the error log; past LOG_MAX the log starts over, the old one kept beside it.
+        True if written (never, without a log: in tests)."""
+        path = self.error_log
+        if path is None:
+            return False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > LOG_MAX:
+                os.replace(path, path.with_name(path.name + ".1"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+            return True
+        except OSError:
+            return False
+
+    def safely(self, draw: Callable[[], None]) -> None:
+        """Draws with `draw`; if that fails, the failure is reported and the program goes on."""
+        try:
+            draw()
+        except Exception as e:
+            self.report(T["draw_error"], e, "drawing")
+
+    def render_now(self) -> None:
+        if self.snap is not None:
+            self.safely(self.draw)
+
+    def draw(self) -> None:
         self.render_topbar()
         tab = self.active_tab
         if tab == "proc":
@@ -2417,16 +2801,21 @@ class TaskManager(App):
                 t.append(f"   GPU{g.index} {util}")
             return t
 
-        left = numbers(f"{s.cpu:.0f}%", fmt_bytes(s.vm.used), [pct0(g.util) for g in s.gpus])
+        gpus_late = bool(s.gpus) and s.gpus_age >= self.gpu_late_after()
+        left = numbers(f"{s.cpu:.0f}%", fmt_bytes(s.vm.used), [G.dash if gpus_late else pct0(g.util) for g in s.gpus])
         widest = numbers("100%", "1023 MB", ["100%"] * len(s.gpus))     # as wide as those numbers get
         width = bar.size.width or max(20, self.size.width - 2)
         clock = Text(time.strftime("%H:%M:%S", time.localtime(s.t)), style="dim")
         speed = Text(T["speed"].format(n=f"{self.interval:g}") + "   ", style="dim")
-        # how often it reads, before the clock, when it fits beside the numbers at their widest (so it does
-        # not come and go as they change); on a narrow screen the numbers come first
-        self.speed_in_bar = not self.paused and widest.cell_len + 1 + speed.cell_len + clock.cell_len <= width
-        if self.paused:
-            right = Text(T["paused"], style="bold yellow")
+        # what is wrong, if anything: paused, no new readings for a long time, or the cards not answering
+        stale = self.stale_for()
+        notice = (T["paused"] if self.paused else T["stale"].format(n=f"{stale:.0f}") if stale
+                  else T["gpus_late"].format(n=f"{s.gpus_age:.0f}") if gpus_late else None)
+        # else how often it reads, before the clock, when it fits beside the numbers at their widest (so it
+        # does not come and go as they change); on a narrow screen the numbers come first
+        self.speed_in_bar = notice is None and widest.cell_len + 1 + speed.cell_len + clock.cell_len <= width
+        if notice:
+            right = Text(notice, style="bold yellow")
         else:
             right = Text.assemble(speed, clock) if self.speed_in_bar else clock
         bar.update(two_sided(left, right, width))
@@ -2722,6 +3111,8 @@ class TaskManager(App):
         s = self.snap
         rows = []
         for i, t in enumerate(s.per_cpu_times):
+            if t is None:                       # switched off
+                continue
             user, kern, _ = CoreGrid.split(t)
             if user + kern >= 5:
                 rows.append((min(100.0, user + kern), i, user, kern))
@@ -2873,12 +3264,14 @@ class TaskManager(App):
         first = panels[0][0]
         width = first.query_one(".gp-title", Static).size.width or 40
         at = self.history.times()
+        late = self.snap.gpus_age >= self.gpu_late_after()   # the numbers below are that old: say so
         for panel, g in panels:
             title, name = T["gpu_n"].format(n=g.index), g.name
             if len(title) + 1 + len(name) > width and name.startswith("NVIDIA "):
                 name = name[len("NVIDIA "):]       # every card here is NVIDIA's: short of room, that goes first
-            panel.query_one(".gp-title", Static).update(
-                two_sided(Text(title, style="bold"), Text(name, style="dim"), width, cut="right"))
+            right = (Text(T["gpus_late"].format(n=f"{self.snap.gpus_age:.0f}"), style="bold yellow") if late
+                     else Text(name, style="dim"))
+            panel.query_one(".gp-title", Static).update(two_sided(Text(title, style="bold"), right, width, cut="right"))
             panel.query_one(Graph).set_series(self.gpu_series(g), at, self.interval, self.span)
         if first.has_class("compact"):
             return                                 # too small for numbers and processes: graphs only
@@ -2927,7 +3320,7 @@ class TaskManager(App):
         if isinstance(event.item, PerfItem):
             self.perf_sel = event.item.key
             if self.snap and self.active_tab == "perf":
-                self.render_perf()
+                self.safely(self.render_perf)
 
     @on(DataTable.RowSelected, "#proc-table")
     def _proc_toggle(self, event: DataTable.RowSelected) -> None:
@@ -2941,7 +3334,7 @@ class TaskManager(App):
             self.expanded ^= {g.key}
         else:
             return
-        self.render_proc()
+        self.safely(self.render_proc)
 
     @on(DataTable.HeaderSelected)
     def _header_click(self, event: DataTable.HeaderSelected) -> None:
@@ -3010,7 +3403,7 @@ class TaskManager(App):
 
     def gpu_turned(self) -> None:
         self.refresh_bindings()
-        self.query_one("#gpu-box", GpuBox).place_cards()
+        self.safely(self.query_one("#gpu-box", GpuBox).place_cards)
         self.call_after_refresh(self.render_now)
 
     def action_zoom(self) -> None:
@@ -3021,12 +3414,14 @@ class TaskManager(App):
     def action_cores(self) -> None:
         self.show_cores = not self.show_cores
         if self.snap and self.active_tab == "perf":
-            self.render_perf()
+            self.safely(self.render_perf)
 
     def action_pause(self) -> None:
         self.paused = not self.paused
+        if not self.paused and self.read_at is not None:
+            self.read_at = time.monotonic()    # the wait for the next reading starts now, not at the pause
         if self.snap:
-            self.render_topbar()
+            self.safely(self.render_topbar)
 
     def action_speed(self) -> None:
         """u: the next update speed. The graphs keep what they have: each reading stays where it was taken."""
@@ -3037,11 +3432,11 @@ class TaskManager(App):
         if self.snap:
             self.render_now()
         if not self.speed_in_bar:              # paused, or no room in the top bar: say it here
-            self.notify(T["speed"].format(n=f"{self.interval:g}"), timeout=3)
+            self.notify(T["speed"].format(n=f"{self.interval:g}"), timeout=3, markup=False)
         if self.settings is not None:          # the next start begins at this speed
             problem = save_interval(self.interval, self.settings)
             if problem:
-                self.notify(problem, severity="warning", timeout=8)
+                self.notify(problem, severity="warning", timeout=8, markup=False)
 
     def action_speed_unlisted(self) -> None:
         self.action_speed()
@@ -3054,7 +3449,8 @@ class TaskManager(App):
             ncpu=self.sampler.ncpu, config=tilde(CONFIG_FILE), projects=projects,
             tab_keys="  ".join(t.split(" ", 1)[0] for t in tabs),
             tab_names=sep.join(t.split(" ", 1)[1] for t in tabs),
-            speeds=sep.join(f"{s:g}" for s in self.speeds), now=f"{self.interval:g}")))
+            speeds=sep.join(f"{s:g}" for s in self.speeds), now=f"{self.interval:g}",
+            log=tilde(self.error_log or ERROR_LOG))))
 
     def action_end_task(self) -> None:
         tab = self.active_tab
@@ -3072,7 +3468,7 @@ class TaskManager(App):
             if g is None:
                 return
             if g.key == "kernel":
-                self.notify(T["no_kernel"], severity="warning")
+                self.notify(T["no_kernel"], severity="warning", markup=False)
                 return
             roots = g.roots
             title, targets = g.label, roots + [m for m in g.members if m not in roots]
@@ -3082,23 +3478,23 @@ class TaskManager(App):
             if p is None:
                 return
             if p.kernel:
-                self.notify(T["no_kernel"], severity="warning")
+                self.notify(T["no_kernel"], severity="warning", markup=False)
                 return
             grp = self.group_of_pid(p.pid)
             title, targets, note = p.name, [p], end_note(grp.key) if grp else None
         else:
-            self.notify(T["nothing"])
+            self.notify(T["nothing"], markup=False)
             return
         if len(targets) == 1 and targets[0].pid == 1:
-            self.notify(T["no_init"], severity="warning")
+            self.notify(T["no_init"], severity="warning", markup=False)
             return
         me = os.getpid()
         if len(targets) == 1 and targets[0].pid == me:
-            self.notify(T["no_self"], severity="warning")
+            self.notify(T["no_self"], severity="warning", markup=False)
             return
         targets = [p for p in targets if p.pid > 1 and p.pid != me]
         if not targets:
-            self.notify(T["nothing"])
+            self.notify(T["nothing"], markup=False)
             return
         self.push_screen(EndTaskScreen(T["end_title"].format(name=title), self.end_body(targets, note)),
                          lambda choice: self.do_end(targets, choice))
@@ -3146,14 +3542,21 @@ class TaskManager(App):
             msgs.append(T["denied"].format(n=denied, users=", ".join(sorted(denied_users))))
         if gone:
             msgs.append(T["gone"].format(n=gone))
-        self.notify("\n".join(msgs), severity="warning" if denied else "information")
-        self.set_timer(0.4, lambda: self.run_worker(self.tick(force=True)))
+        self.notify("\n".join(msgs), severity="warning" if denied else "information", markup=False)
+        self.set_timer(0.4, lambda: self.read_now(force=True))
 
 
 def main() -> None:
     saved, problem = load_interval() if ARGS.interval is None else (None, None)
     interval = ARGS.interval or saved or 1.0       # --interval, else the speed last chosen with u, else 1 s
-    TaskManager(Sampler(ARGS.lang), interval, SETTINGS_FILE, problem).run()
+    app = TaskManager(Sampler(ARGS.lang), interval, SETTINGS_FILE, problem, ERROR_LOG)
+    app.run()
+    if app.left_stuck():
+        # A thread is still inside the kernel or NVIDIA's library: the clean-up that normally follows
+        # (the library's own, at exit) could wait on it for ever. The terminal is already restored.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(app.return_code or 0)
 
 
 if __name__ == "__main__":

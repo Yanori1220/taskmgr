@@ -247,6 +247,9 @@ class ShotApp(tm.TaskManager):
         if fed:
             await super().tick(force=True)
 
+    def stale_for(self) -> float:   # it is never kept waiting for a reading: it reads only when fed
+        return 0.0
+
 
 def rgb(color, default):
     if color is None or color.is_default:

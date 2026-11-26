@@ -148,9 +148,28 @@ groups stay off until the file is fixed.
 
 ## Cost
 
-It reads `/proc` itself instead of creating psutil objects for every process. On a 64-thread desktop,
-one reading takes about 30 ms. At one reading a second the app uses 4–7% of one core and about 80 MB of
-memory; every 0.5 seconds, about twice the CPU.
+It reads `/proc` itself instead of creating psutil objects for every process, and reads the GPUs at the
+same time, in a thread of their own. On a 64-thread desktop with two GPUs, one reading takes about 16 ms
+and 27 ms of CPU time. At one reading a second the app uses 4–7% of one core, and about 90 MB of memory
+once its graphs hold their 15 minutes of readings; every 0.5 seconds, about twice the CPU.
+
+## Left open for weeks
+
+Task Manager is meant to stay open. Its memory stays level however long it runs and however often you
+switch tabs (Textual's footer kept every set of keys it had ever shown; that is worked around). When
+something goes wrong, it carries on and says so in the top bar:
+
+- **No new reading for N s**: a reading has not come back, so the numbers on screen are getting old.
+  When it is stuck on one process's files (a process stuck in the kernel, as after a GPU fault, can
+  hold its `/proc/<pid>/cmdline` for good), that process is skipped after 30 s: it stays in the lists,
+  without its memory and disk use, and readings carry on.
+- **GPUs not answering for N s**: the NVIDIA driver has not answered. The cards are read in a thread
+  of their own, so everything else keeps updating, and their graphs have a gap until the driver answers.
+- Anything else that fails, in a reading or in drawing, is shown once and written down with its
+  traceback in `~/.local/state/taskmgr/errors.log` (in `$XDG_STATE_HOME/taskmgr/` if that is set).
+  The file is made only when something fails, and kept under 1 MB (the older part in `errors.log.1`).
+
+`q` quits at once in all of these cases; with the GPUs not answering, after 2 seconds.
 
 ## Notes
 
