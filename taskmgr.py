@@ -1878,6 +1878,19 @@ class CoreGrid(Widget):
         return Text("\n", no_wrap=True, overflow="ellipsis").join(lines)
 
 
+class KeyFooter(Footer):
+    """Textual's Footer without its leak. Each time the keys it lists change (another tab, another window
+    size), it builds new key widgets, and each new key watches the footer's `compact` setting. Textual
+    (8.2.8) drops the watchers of removed keys only when `compact` changes, which it never does here, so
+    every key ever built stayed in memory: about 20 widgets each time the tab changed. After each rebuild,
+    the watchers of keys that are gone are dropped, by the same test Textual itself uses."""
+
+    async def recompose(self) -> None:
+        await super().recompose()
+        for watchers in getattr(self, "__watchers", {}).values():
+            watchers[:] = [(node, callback) for node, callback in watchers if not getattr(node, "_closing", False)]
+
+
 class PerfItem(ListItem):
     """One entry in the Performance tab's left-hand list: name, value, a small graph."""
 
@@ -2260,7 +2273,7 @@ class TaskManager(App):
             if self.has_gpu:
                 with TabPane(T["tab_gpu"], id="gpu"):
                     yield GpuBox(len(self.sampler.gpus.handles), self.gpu_min_height, id="gpu-box")
-        yield Footer()
+        yield KeyFooter()
 
     async def on_mount(self) -> None:
         box = self.query_one("#pd-cores-box")
